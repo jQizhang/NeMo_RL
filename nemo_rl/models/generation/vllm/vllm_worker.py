@@ -510,6 +510,13 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+        # elif "MiniMaxM2ForCausalLM" in getattr(hf_config, "architectures", []):
+        #     if "quantization_config" in hf_config:
+        #         assert load_format == "dummy", (
+        #             "Loading quantized MiniMax-M2 models is currently only supported with load_format='dummy'."
+        #         )
+        #         # disable quantization so vLLM loads the model in bf16
+        #         vllm_kwargs["hf_overrides"]["quantization_config"] = {}
         elif any(
             arch in getattr(hf_config, "architectures", [])
             for arch in (
