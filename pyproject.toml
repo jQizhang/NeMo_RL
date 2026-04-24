@@ -74,15 +74,15 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7f2a703ed51ac1f7af07f5e1453b2d3267d37d50",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.1",
+  "vllm",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
@@ -130,6 +130,10 @@ build = [
   "pybind11",
   # Build requirement for flash-attn
   "psutil",
+  # Build requirements for vllm (path source, no build isolation)
+  "cmake>=3.26.1",
+  # setuptools-scm 10.x split out vcs_versioning which breaks the metadata hook
+  "setuptools-scm>=8.0,<9",
 ]
 docs = [
   "sphinx",
@@ -163,6 +167,7 @@ test = [
 megatron-core = { workspace = true }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
+vllm = { path = "3rdparty/vllm-workspace/vllm", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchaudio/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
@@ -225,6 +230,7 @@ no-build-isolation-package = [
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sglang-kernel",
+  "vllm",                     # path-sourced editable build against project's torch 2.10
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -247,6 +253,8 @@ override-dependencies = [
   "nvidia-modelopt[torch]>=0.39.0",
   "torch==2.10.0",
   "torchaudio==2.10.0",
+  # vllm PR #40760 requires torchvision==0.26.0; keep project's 0.25.0 to stay consistent with torch 2.10
+  "torchvision==0.25.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
@@ -258,8 +266,8 @@ override-dependencies = [
   "flashinfer-python>=0.5.0",
   "flashinfer-cubin>=0.5.0",
   # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
-  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl>=4.4.1",
+  # vllm PR #40760 requires >=4.4.2. Override to >=4.4.2 so uv can resolve.
+  "nvidia-cutlass-dsl>=4.4.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
@@ -340,6 +348,17 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 sglang-kernel = [{ requirement = "torch", match-runtime = true }]
+# vllm build-system.requires minus torch (torch already in venv via no-build-isolation)
+vllm = [
+  "cmake>=3.26.1",
+  "ninja",
+  "packaging>=24.2",
+  "setuptools>=77.0.3,<81.0.0",
+  # setuptools-scm 10.x split out vcs_versioning which breaks the metadata hook
+  "setuptools-scm>=8.0,<9",
+  "wheel",
+  "jinja2",
+]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -367,7 +386,8 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
-version = "v2.0.0+7b6b556"
+# Bumped to 7f2a703 to expose tf32_hc_prenorm_gemm required by DeepSeek-V4 support (vllm PR #40760)
+version = "v2.0.0+7f2a703"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]

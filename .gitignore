@@ -51,3 +51,6 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
+
+# vllm source checkout (path-sourced via pyproject.toml; users fetch separately)
+3rdparty/vllm-workspace/
