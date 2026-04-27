@@ -74,7 +74,8 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7f2a703ed51ac1f7af07f5e1453b2d3267d37d50",
+  # DeepGEMM pin must match vllm's cmake/external_projects/deepgemm.cmake (and tools/install_deepgemm.sh).
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@891d57b4db1071624b5c8fa0d1e51cb317fa709f",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
@@ -83,7 +84,7 @@ vllm = [
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "nvidia-cutlass-dsl>=4.4.2",
 ]
 sglang = [
   "sglang",
@@ -253,7 +254,7 @@ override-dependencies = [
   "nvidia-modelopt[torch]>=0.39.0",
   "torch==2.10.0",
   "torchaudio==2.10.0",
-  # vllm PR #40760 requires torchvision==0.26.0; keep project's 0.25.0 to stay consistent with torch 2.10
+  # vllm main requires torchvision==0.26.0 (paired with torch 2.11); keep project's 0.25.0 to stay consistent with torch 2.10.
   "torchvision==0.25.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
@@ -266,12 +267,13 @@ override-dependencies = [
   "flashinfer-python>=0.5.0",
   "flashinfer-cubin>=0.5.0",
   # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
-  # vllm PR #40760 requires >=4.4.2. Override to >=4.4.2 so uv can resolve.
+  # vllm main requires >=4.4.2. Override to >=4.4.2 so uv can resolve.
   "nvidia-cutlass-dsl>=4.4.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
-  # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
+  # vLLM 0.17.0+ code is compatible with transformers v5, but vllm main's requirements/common.txt
+  # currently excludes 5.0.*–5.5.0 (`!= 5.3.*` etc.). Override to keep 5.3.0 across the project
+  # (NeMo-RL pins exactly 5.3.0; megatron-bridge needs >=5.0.0,<=5.3.0).
   "transformers==5.3.0",
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
@@ -385,9 +387,9 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
-# This version has to match the version in the commit/rev/tag used
-# Bumped to 7f2a703 to expose tf32_hc_prenorm_gemm required by DeepSeek-V4 support (vllm PR #40760)
-version = "v2.0.0+7f2a703"
+# This version has to match the version in the commit/rev/tag used.
+# Pin matches vllm main's cmake/external_projects/deepgemm.cmake (commit 891d57b).
+version = "v2.0.0+891d57b"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
