@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import time
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional
@@ -73,6 +74,18 @@ from nemo_rl.models.policy.workers.patches import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def _get_current_rss_gb() -> Optional[float]:
+    """Return current process RSS in GiB when Linux procfs is available."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024**2)
+    except OSError:
+        return None
+    return None
 
 
 def dtensor_params_generator(
@@ -200,6 +213,19 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+
+    def _log_offload_progress(self, stage: str, start_time: float) -> None:
+        elapsed = time.perf_counter() - start_time
+        cpu_rss_gb = _get_current_rss_gb()
+        cpu_rss_text = f"{cpu_rss_gb:.2f}GB" if cpu_rss_gb is not None else "unknown"
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        print(
+            f"{self!r}: {stage} after {elapsed:.2f}s | "
+            f"cpu_rss={cpu_rss_text}, "
+            f"gpu_allocated={allocated:.2f}GB, gpu_reserved={reserved:.2f}GB",
+            flush=True,
+        )
 
     def __init__(
         self,
@@ -1031,27 +1057,68 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
+        start_time = time.perf_counter()
+        self._log_offload_progress("offload_before_refit/start", start_time)
         torch.randn(1).cuda()  # wake up torch allocator
+        self._log_offload_progress(
+            "offload_before_refit/allocator_awake", start_time
+        )
         if self.optimizer is not None:
+            self._log_offload_progress(
+                "offload_before_refit/optimizer_to_cpu_start", start_time
+            )
             self.move_optimizer_to_device("cpu")
+            self._log_offload_progress(
+                "offload_before_refit/optimizer_to_cpu_done", start_time
+            )
 
+        self._log_offload_progress("offload_before_refit/gc_start", start_time)
         gc.collect()
+        self._log_offload_progress(
+            "offload_before_refit/empty_cache_start", start_time
+        )
         torch.cuda.empty_cache()
+        self._log_offload_progress("offload_before_refit/done", start_time)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
-        self.model = self.move_to_cpu(self.model)
+        start_time = time.perf_counter()
+        self._log_offload_progress("offload_after_refit/start", start_time)
+        self._log_offload_progress(
+            "offload_after_refit/model_to_cpu_start", start_time
+        )
+        self.model = self.move_to_cpu(
+            self.model,
+            log_prefix="offload_after_refit/model_to_cpu",
+            start_time=start_time,
+        )
+        self._log_offload_progress(
+            "offload_after_refit/model_to_cpu_done", start_time
+        )
         self.model.eval()
+        self._log_offload_progress(
+            "offload_after_refit/model_eval_done", start_time
+        )
         torch.randn(1).cuda()  # wake up torch allocator
+        self._log_offload_progress(
+            "offload_after_refit/allocator_awake", start_time
+        )
+        self._log_offload_progress(
+            "offload_after_refit/offload_before_refit_start", start_time
+        )
         self.offload_before_refit()  # rerun the old offload function
+        self._log_offload_progress(
+            "offload_after_refit/offload_before_refit_done", start_time
+        )
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
-            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+            "GPU Memory after optimizer offload: "
+            f"{allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
@@ -1079,10 +1146,32 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         torch.cuda.empty_cache()
         return model
 
-    def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
+    def move_to_cpu(
+        self,
+        model: torch.nn.Module,
+        log_prefix: Optional[str] = None,
+        start_time: Optional[float] = None,
+    ) -> torch.nn.Module:
+        if log_prefix is not None:
+            if start_time is None:
+                start_time = time.perf_counter()
+            self._log_offload_progress(
+                f"{log_prefix}/move_to_device_start", start_time
+            )
         model = self.move_to_device(model, "cpu")
+        if log_prefix is not None:
+            self._log_offload_progress(
+                f"{log_prefix}/move_to_device_done", start_time
+            )
+            self._log_offload_progress(f"{log_prefix}/gc_start", start_time)
         gc.collect()
+        if log_prefix is not None:
+            self._log_offload_progress(
+                f"{log_prefix}/empty_cache_start", start_time
+            )
         torch.cuda.empty_cache()
+        if log_prefix is not None:
+            self._log_offload_progress(f"{log_prefix}/done", start_time)
         return model
 
     def save_checkpoint(

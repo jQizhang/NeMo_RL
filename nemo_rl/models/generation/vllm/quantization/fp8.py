@@ -172,6 +172,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    use_deep_gemm = vllm_cfg.get("use_deep_gemm", False)
 
     # Validate configuration: kv_cache_dtype
     if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]:
@@ -198,9 +199,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         use_fp8_weights=use_fp8_weights,
     )
 
-    if vllm_cfg.get("use_deep_gemm", False):
+    if use_deep_gemm:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -452,6 +453,22 @@ def _get_param_module_name(param_name: str) -> str | None:
     return None
 
 
+def _get_moe_param_module_name(param_name: str) -> str | None:
+    for suffix in (
+        ".w13_weight_scale_inv",
+        ".w2_weight_scale_inv",
+        ".w13_weight_scale",
+        ".w2_weight_scale",
+    ):
+        if param_name.endswith(suffix):
+            return param_name[: -len(suffix)]
+    return None
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
 def _copy_deepseek_v4_bmm_weight(param, loaded_weight: torch.Tensor) -> bool:
     if param.data.ndim != 3 or loaded_weight.ndim != 2:
         return False
@@ -543,6 +560,284 @@ def _try_load_deepseek_v4_bmm_param(
     return False
 
 
+def _sync_scale_alias(layer, source_param, new_data: torch.Tensor) -> None:
+    for attr in ("weight_scale", "weight_scale_inv"):
+        if not hasattr(layer, attr):
+            continue
+        scale_param = getattr(layer, attr)
+        if scale_param is source_param:
+            continue
+        if scale_param.data.shape == new_data.shape:
+            _set_parameter_data_preserving_attrs(scale_param, new_data)
+
+
+def _set_parameter_data_preserving_attrs(param, new_data: torch.Tensor) -> None:
+    """Update parameter storage without replacing the Parameter object."""
+    if (
+        param.data.shape == new_data.shape
+        and param.data.dtype == new_data.dtype
+        and param.data.device == new_data.device
+        and param.data.stride() == new_data.stride()
+    ):
+        param.data.copy_(new_data)
+    else:
+        param.data = new_data
+
+
+def _copy_scale_slice_if_compatible(layer, source_param, shard_offset, dg_scale) -> bool:
+    if source_param.data.ndim != 2:
+        return False
+    if source_param.data.shape[0] < shard_offset + dg_scale.shape[0]:
+        return False
+    scale_slice = source_param.data.narrow(0, shard_offset, dg_scale.shape[0])
+    if scale_slice.shape != dg_scale.shape:
+        return False
+    scale_slice.copy_(dg_scale)
+
+    for attr in ("weight_scale", "weight_scale_inv"):
+        if not hasattr(layer, attr):
+            continue
+        scale_param = getattr(layer, attr)
+        if scale_param is source_param:
+            continue
+        if scale_param.data.shape != source_param.data.shape:
+            continue
+        scale_param.data.narrow(0, shard_offset, dg_scale.shape[0]).copy_(dg_scale)
+    return True
+
+
+def _try_load_deepgemm_refit_scale(
+    module_map: dict[str, torch.nn.Module],
+    param_name: str,
+    param,
+    loaded_weight,
+    loaded_shard_id=None,
+) -> bool:
+    if not param_name.endswith((".weight_scale", ".weight_scale_inv")):
+        return False
+    if not isinstance(loaded_weight, torch.Tensor) or loaded_weight.ndim != 2:
+        return False
+    if (
+        param.data.shape == loaded_weight.shape
+        and param.data.dtype == loaded_weight.dtype
+    ):
+        return False
+
+    module_name = _get_param_module_name(param_name)
+    if module_name is None:
+        return False
+
+    layer = module_map.get(module_name)
+    if layer is None or getattr(layer, "is_bmm", False):
+        return False
+    if not hasattr(layer, "weight") or not hasattr(layer, "weight_block_size"):
+        return False
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+    block_m, block_n = tuple(layer.weight_block_size)
+
+    if isinstance(loaded_shard_id, int) and hasattr(layer, "output_sizes"):
+        from vllm.model_executor.layers.linear import adjust_block_scale_shard
+
+        shard_offset = sum(layer.output_sizes[:loaded_shard_id])
+        shard_size = layer.output_sizes[loaded_shard_id]
+        shard_offset //= layer.tp_size
+        shard_size //= layer.tp_size
+        shard_size, shard_offset = adjust_block_scale_shard(
+            layer.weight_block_size, shard_size, shard_offset
+        )
+        if loaded_weight.shape[0] == shard_size:
+            raw_scale = loaded_weight
+        else:
+            scale_start = getattr(param, "tp_rank", 0) * shard_size
+            if loaded_weight.shape[0] < scale_start + shard_size:
+                return False
+            raw_scale = loaded_weight.narrow(0, scale_start, shard_size)
+
+        weight_offset = shard_offset * block_m
+        weight_rows = raw_scale.shape[0] * block_m
+        if layer.weight.data.shape[0] < weight_offset + weight_rows:
+            return False
+        weight_slice = layer.weight.data.narrow(0, weight_offset, weight_rows)
+        dg_weight, dg_scale = deepgemm_post_process_fp8_weight_block(
+            wq=weight_slice,
+            ws=raw_scale,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
+        )
+        if dg_weight.shape != weight_slice.shape:
+            return False
+        weight_slice.copy_(dg_weight)
+        return _copy_scale_slice_if_compatible(
+            layer, param, weight_offset, dg_scale
+        )
+
+    expected_rows = _ceil_div(layer.weight.data.shape[0], block_m)
+    expected_cols = _ceil_div(layer.weight.data.shape[1], block_n)
+    raw_scale = loaded_weight
+
+    if raw_scale.shape[0] != expected_rows:
+        start = getattr(param, "tp_rank", 0) * expected_rows
+        if raw_scale.shape[0] < start + expected_rows:
+            return False
+        raw_scale = raw_scale.narrow(0, start, expected_rows)
+
+    if raw_scale.shape[1] != expected_cols:
+        start = getattr(param, "tp_rank", 0) * expected_cols
+        if raw_scale.shape[1] < start + expected_cols:
+            return False
+        raw_scale = raw_scale.narrow(1, start, expected_cols)
+
+    if raw_scale.shape != (expected_rows, expected_cols):
+        return False
+
+    dg_weight, dg_scale = deepgemm_post_process_fp8_weight_block(
+        wq=layer.weight.data,
+        ws=raw_scale,
+        quant_block_shape=tuple(layer.weight_block_size),
+        use_e8m0=is_deep_gemm_e8m0_used(),
+    )
+    if dg_weight.shape != layer.weight.data.shape:
+        return False
+    _set_parameter_data_preserving_attrs(layer.weight, dg_weight)
+    if dg_scale.shape != param.data.shape:
+        return False
+    _set_parameter_data_preserving_attrs(param, dg_scale)
+    _sync_scale_alias(layer, param, dg_scale)
+    return True
+
+
+def _slice_moe_loaded_scale(
+    loaded_weight: torch.Tensor,
+    expected_shape: tuple[int, int],
+    shard_dim: int,
+    tp_rank: int,
+) -> torch.Tensor | None:
+    expected_rows, expected_cols = expected_shape
+    raw_scale = loaded_weight
+
+    if raw_scale.shape[0] != expected_rows:
+        if shard_dim != 0:
+            return None
+        start = tp_rank * expected_rows
+        if raw_scale.shape[0] < start + expected_rows:
+            return None
+        raw_scale = raw_scale.narrow(0, start, expected_rows)
+
+    if raw_scale.shape[1] != expected_cols:
+        if shard_dim != 1:
+            return None
+        start = tp_rank * expected_cols
+        if raw_scale.shape[1] < start + expected_cols:
+            return None
+        raw_scale = raw_scale.narrow(1, start, expected_cols)
+
+    if raw_scale.shape != expected_shape:
+        return None
+    return raw_scale
+
+
+def _try_load_deepgemm_refit_moe_scale(
+    module_map: dict[str, torch.nn.Module],
+    param_name: str,
+    param,
+    loaded_weight,
+    args,
+    kwargs,
+) -> bool:
+    if not isinstance(loaded_weight, torch.Tensor) or loaded_weight.ndim != 2:
+        return False
+    if "scale" not in param_name:
+        return False
+
+    module_name = _get_moe_param_module_name(param_name)
+    if module_name is None:
+        return False
+    layer = module_map.get(module_name)
+    if not isinstance(layer, FusedMoE):
+        return False
+    if not hasattr(layer, "weight_block_size"):
+        return False
+
+    weight_name = args[2] if len(args) > 2 else kwargs.get("weight_name")
+    shard_id = args[3] if len(args) > 3 else kwargs.get("shard_id")
+    expert_id = args[4] if len(args) > 4 else kwargs.get("expert_id")
+    if shard_id not in ("w1", "w2", "w3") or expert_id is None:
+        return False
+    expert_id = int(expert_id)
+
+    if hasattr(layer, "_map_global_expert_id_to_local_expert_id"):
+        local_expert_id = int(
+            layer._map_global_expert_id_to_local_expert_id(expert_id)
+        )
+    else:
+        local_expert_id = expert_id
+    if local_expert_id < 0:
+        return False
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+    block_m, block_n = tuple(layer.weight_block_size)
+    shard_dim = {"w1": 0, "w2": 1, "w3": 0}[shard_id]
+    if getattr(param, "is_transposed", False):
+        shard_dim = int(not shard_dim)
+
+    if shard_id in ("w1", "w3"):
+        if (
+            local_expert_id >= layer.w13_weight.shape[0]
+            or local_expert_id >= param.shape[0]
+        ):
+            return False
+        weight_data = layer.w13_weight.data[local_expert_id]
+        scale_data = param.data[local_expert_id]
+        shard_size = weight_data.shape[shard_dim] // 2
+        shard_offset = 0 if shard_id == "w1" else shard_size
+        weight_slice = weight_data.narrow(shard_dim, shard_offset, shard_size)
+        scale_shard_size = scale_data.shape[shard_dim] // 2
+        scale_offset = 0 if shard_id == "w1" else scale_shard_size
+        scale_slice = scale_data.narrow(shard_dim, scale_offset, scale_shard_size)
+    else:
+        if (
+            local_expert_id >= layer.w2_weight.shape[0]
+            or local_expert_id >= param.shape[0]
+        ):
+            return False
+        weight_slice = layer.w2_weight.data[local_expert_id]
+        scale_slice = param.data[local_expert_id]
+
+    expected_shape = (
+        _ceil_div(weight_slice.shape[0], block_m),
+        _ceil_div(weight_slice.shape[1], block_n),
+    )
+    raw_scale = _slice_moe_loaded_scale(
+        loaded_weight,
+        expected_shape,
+        shard_dim=shard_dim,
+        tp_rank=layer.tp_rank,
+    )
+    if raw_scale is None:
+        return False
+
+    dg_weight, dg_scale = deepgemm_post_process_fp8_weight_block(
+        wq=weight_slice,
+        ws=raw_scale,
+        quant_block_shape=tuple(layer.weight_block_size),
+        use_e8m0=is_deep_gemm_e8m0_used(),
+    )
+    if dg_weight.shape != weight_slice.shape or dg_scale.shape != scale_slice.shape:
+        return False
+    weight_slice.copy_(dg_weight)
+    scale_slice.copy_(dg_scale)
+    return True
+
+
 def _wrap_weight_loaders_for_refit(model):
     """Wrap vLLM parameter loaders during FP8 refit.
 
@@ -569,6 +864,27 @@ def _wrap_weight_loaders_for_refit(model):
             try:
                 if _try_load_deepseek_v4_bmm_param(
                     module_map, _param_name, _param, loaded_weight
+                ):
+                    return None
+                if _try_load_deepgemm_refit_moe_scale(
+                    module_map,
+                    _param_name,
+                    _param,
+                    loaded_weight,
+                    args,
+                    kwargs,
+                ):
+                    return_success = kwargs.get(
+                        "return_success", args[5] if len(args) > 5 else False
+                    )
+                    return True if return_success else None
+                loaded_shard_id = args[2] if len(args) > 2 else None
+                if _try_load_deepgemm_refit_scale(
+                    module_map,
+                    _param_name,
+                    _param,
+                    loaded_weight,
+                    loaded_shard_id,
                 ):
                     return None
                 return _weight_loader(*args, **kwargs)
@@ -745,23 +1061,12 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             is_bmm=is_bmm,
             bmm_batch_size=bmm_batch_size,
         )
-        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
-        # Instead of creating new torch.nn.Parameter (vllm stock uses
-        # replace_parameter), we update the data in place to preserve
-        # Parameter object identity and the `weight_loader` attribute that
-        # NeMo-RL's refit pipeline relies on.
-        #
-        # For is_bmm=True the new tensor is 3D while layer.weight is 2D, so
-        # `.data.copy_()` (which requires same shape) would fail. Rebind
-        # `.data` to the new tensor instead — Parameter object identity (and
-        # weight_loader) is preserved, but the shape now reflects the BMM
-        # layout. Same for weight_scale.
-        if is_bmm:
-            layer.weight.data = dg_weight
-            layer.weight_scale.data = dg_weight_scale
-        else:
-            layer.weight.data.copy_(dg_weight)
-            layer.weight_scale.data.copy_(dg_weight_scale)
+        # vLLM stock uses replace_parameter() here. NeMo-RL must preserve the
+        # Parameter object so the refit weight_loader survives, but DeepGEMM may
+        # change the underlying layout. On Blackwell E8M0, non-BMM scale tensors
+        # are packed and can change shape (for example, dim1 32 -> 8).
+        _set_parameter_data_preserving_attrs(layer.weight, dg_weight)
+        _set_parameter_data_preserving_attrs(layer.weight_scale, dg_weight_scale)
 
         # vllm-stock writes the DG-transformed scale back to `weight_scale_inv`
         # (see model_executor/kernels/linear/scaled_mm/deep_gemm.py:replace_parameter
@@ -773,7 +1078,9 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         # (`.data = ...`) rather than `.data.copy_()` to handle the BMM 2D→3D
         # shape change.
         if hasattr(layer, "weight_scale_inv"):
-            layer.weight_scale_inv.data = dg_weight_scale
+            _set_parameter_data_preserving_attrs(
+                layer.weight_scale_inv, dg_weight_scale
+            )
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -789,12 +1096,24 @@ def process_weights_after_loading(self, layer) -> None:
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
+    if (
+        hasattr(layer, "weight_scale_inv")
+        and layer.weight_scale_inv.dtype == torch.int32
+    ):
+        if hasattr(layer, "weight_scale"):
+            _set_parameter_data_preserving_attrs(
+                layer.weight_scale, layer.weight_scale_inv.data
+            )
+        if not hasattr(layer, "input_scale"):
+            layer.input_scale = None
+        return
+
     weight_scale = layer.weight_scale_inv
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
-    layer.weight.data = weight.data
+    _set_parameter_data_preserving_attrs(layer.weight, weight.data)
     if hasattr(layer, "weight_scale"):
         # Not the first time to call this function, just need to update the data
-        layer.weight_scale.copy_(weight_scale.data)
+        _set_parameter_data_preserving_attrs(layer.weight_scale, weight_scale.data)
     else:
         # The first time to call this function, create a new parameter and update the tp status
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
@@ -806,7 +1125,7 @@ def process_weights_after_loading(self, layer) -> None:
     # consumers read `weight_scale_inv` directly, so keep it in sync with
     # the just-processed weight_scale.
     if hasattr(layer, "weight_scale_inv"):
-        layer.weight_scale_inv.data = weight_scale.data
+        _set_parameter_data_preserving_attrs(layer.weight_scale_inv, weight_scale.data)
 
     maybe_post_process_fp8_weight_block(layer)
 
@@ -839,6 +1158,9 @@ def process_weights_after_loading_moe(self, layer) -> None:
     w13_input_scale = layer.w13_input_scale
     w2_input_scale = layer.w2_input_scale
 
+    if w13_scale.dtype == torch.int32 or w2_scale.dtype == torch.int32:
+        return
+
     # Use vLLM's backend-specific weight conversion (handles deepgemm,
     # flashinfer, triton, etc. based on self.fp8_backend).
     w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
@@ -852,11 +1174,16 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Use .copy_() to preserve weight_loader attribute on Parameters.
-    layer.w13_weight.copy_(w13)
-    layer.w2_weight.copy_(w2)
-    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    # Keep Parameter objects while allowing backend-specific layouts to change
+    # the underlying tensor shape or dtype.
+    _set_parameter_data_preserving_attrs(layer.w13_weight, w13)
+    _set_parameter_data_preserving_attrs(layer.w2_weight, w2)
+    _set_parameter_data_preserving_attrs(
+        getattr(layer, f"w13_{self.weight_scale_name}"), w13_scale
+    )
+    _set_parameter_data_preserving_attrs(
+        getattr(layer, f"w2_{self.weight_scale_name}"), w2_scale
+    )
 
     # Set up the MoE kernel (same as upstream _setup_kernel but without replace_parameter).
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)

@@ -30,6 +30,13 @@ class VllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
     enforce_eager: NotRequired[bool]
+    # Use vLLM's DeepGEMM FP8 kernels when supported by the platform.
+    use_deep_gemm: NotRequired[bool]
+    # Round FP8 weight scaling factors to powers of two before refit. Required
+    # for DeepGEMM E8M0/packed-scale execution on Blackwell.
+    pow2_weight_scaling_factors: NotRequired[bool]
+    # Round dynamic activation scaling factors to powers of two.
+    pow2_activation_scaling_factors: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.

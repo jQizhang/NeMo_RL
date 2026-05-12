@@ -556,6 +556,7 @@ class RayWorkerGroup:
                         "group_idx": group_idx,
                         "worker_idx": worker_idx,
                         "node_idx": pg_idx,
+                        "bundle_idx": bundle_idx,
                         "local_rank": local_rank,
                         "global_rank": global_rank,
                         "name": name,
@@ -610,6 +611,7 @@ class RayWorkerGroup:
             self._worker_metadata.append(
                 {
                     "node_idx": info["node_idx"],
+                    "bundle_idx": info["bundle_idx"],
                     "local_rank": info["local_rank"],
                     "global_rank": info["global_rank"],
                     "name": info["name"],
