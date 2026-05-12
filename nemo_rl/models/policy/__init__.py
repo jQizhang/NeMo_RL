@@ -111,10 +111,6 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
-    # Controls how policy workers run offload_after_refit after generation weight refit.
-    # "all" dispatches all workers concurrently. "node_local_rank" dispatches workers
-    # by node-local bundle/GPU rank across nodes to reduce per-node CPU memory pressure.
-    offload_after_refit_grouping: NotRequired[Literal["all", "node_local_rank"]]
 
 
 class SequencePackingConfigDisabled(TypedDict):

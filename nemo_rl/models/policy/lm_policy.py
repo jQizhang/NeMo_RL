@@ -261,8 +261,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars=env_vars or {},
             )
 
-        self._worker_node_ip_and_gpu_id: Optional[list[tuple[str, int]]] = None
-
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
@@ -927,68 +925,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def offload_after_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
-        dtensor_cfg = self.cfg.get("dtensor_cfg", None)
-        grouping = None
-        if dtensor_cfg is not None and dtensor_cfg.get("enabled", False):
-            grouping = dtensor_cfg.get("offload_after_refit_grouping", None)
-
-        if grouping is None or grouping == "all":
-            futures = self.worker_group.run_all_workers_single_data(
-                "offload_after_refit"
-            )
-            ray.get(futures)
-            return
-
-        if grouping != "node_local_rank":
-            raise ValueError(
-                "policy.dtensor_cfg.offload_after_refit_grouping must be one of "
-                f"'all' or 'node_local_rank', got {grouping!r}."
-            )
-
-        if self._worker_node_ip_and_gpu_id is None:
-            worker_locations = ray.get(
-                self.worker_group.run_all_workers_single_data(
-                    "report_node_ip_and_gpu_id",
-                )
-            )
-            self._worker_node_ip_and_gpu_id = [
-                (node_ip, int(gpu_id)) for node_ip, gpu_id in worker_locations
-            ]
-
-        worker_indices_by_gpu_id: defaultdict[int, list[int]] = defaultdict(list)
-        for worker_idx, (_, gpu_id) in enumerate(self._worker_node_ip_and_gpu_id):
-            worker_indices_by_gpu_id[gpu_id].append(worker_idx)
-
-        print(
-            "Running policy offload_after_refit in node-local-rank batches: "
-            f"{len(worker_indices_by_gpu_id)} batches, "
-            f"{len(self.worker_group.workers)} workers",
-            flush=True,
-        )
-        for gpu_id in sorted(worker_indices_by_gpu_id):
-            worker_indices = worker_indices_by_gpu_id[gpu_id]
-            node_indices = [
-                self.worker_group.worker_metadata[worker_idx]["node_idx"]
-                for worker_idx in worker_indices
-            ]
-            node_ips = [
-                self._worker_node_ip_and_gpu_id[worker_idx][0]
-                for worker_idx in worker_indices
-            ]
-            print(
-                "Running policy offload_after_refit batch "
-                f"gpu_id={gpu_id}, worker_indices={worker_indices}, "
-                f"node_indices={node_indices}, node_ips={node_ips}",
-                flush=True,
-            )
-            futures = [
-                self.worker_group.run_single_worker_single_data(
-                    "offload_after_refit",
-                    worker_idx=worker_idx,
-                )
-                for worker_idx in worker_indices
-            ]
-            ray.get(futures)
+        futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
+        ray.get(futures)
 
     def save_checkpoint(
         self,
