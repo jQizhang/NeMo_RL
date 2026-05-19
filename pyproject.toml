@@ -91,14 +91,17 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@c9f8b34dcdacc20aa746b786f983492c51072870",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Gemma 4 requires vLLM>=0.19.0 for the OpenAIServingRender preprocess refactor.
-  # TODO: switch back to +cu130 wheel URLs once vLLM publishes them for 0.19.0.
-  "vllm==0.19.0",
+  # +cu130 wheels from GitHub match torch (pytorch-cu130). PyPI default 0.19.0 wheel is +cu12
+  # (libcudart.so.12) and breaks in the cu13 container. See v0.19.0 release assets:
+  # https://github.com/vllm-project/vllm/releases/tag/v0.19.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.19.0/vllm-0.19.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.19.0/vllm-0.19.0+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.19.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
   "flashinfer-cubin==0.6.4",
@@ -391,7 +394,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
-version = "v2.0.0+7b6b556"
+version = "v2.1.1.post3+c9f8b34"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
