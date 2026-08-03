@@ -44,6 +44,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    cp_sharder: Optional[Any] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -59,6 +60,9 @@ def prepare_loss_input(
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
+        cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
+            sequence layout (V2 automodel worker with cp_size > 1); ``logits``
+            are then this rank's CP-local shard while ``data`` stays canonical.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -91,6 +95,7 @@ def prepare_loss_input(
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
                 chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -115,6 +120,7 @@ def prepare_loss_input(
                     sampling_params=None,  # no filtering
                     # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
                     chunk_size=None,
+                    cp_sharder=cp_sharder,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}

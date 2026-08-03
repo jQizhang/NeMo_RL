@@ -23,14 +23,21 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import contextlib
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Generator, Iterator, Optional, Tuple, Union
 
 import torch
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+)
+from nemo_automodel.components.distributed.context_parallel.utils import (
+    get_train_context as get_train_context_automodel,
+)
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -42,13 +49,12 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
-    cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
+    get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
@@ -185,94 +191,141 @@ def apply_top_k_top_p_filtering_for_local_logits(
     return logits
 
 
-def redistribute_logits_for_cp(
-    logits: torch.Tensor,
-    device_mesh: Any,
-    cp_mesh: Any,  # noqa: ARG001
-    sequence_dim: int = 1,
-) -> DTensor:
-    """Redistribute logits for context parallel processing.
+# Student-sequence-aligned cross-tokenizer fields. Teacher-sequence fields (T_t
+# may differ from T_s) stay full length; the loss slices them contiguously by
+# student CP rank because the IPC consumer ships contiguous teacher slices (see
+# FullLogitsPostProcessor below). Single-teacher runs use the unprefixed
+# ``alignment_student_*`` keys, multi-teacher uses ``alignment_{i}_student_*``;
+# the suffix match captures both and excludes ``*_teacher_*``.
+_STUDENT_SEQ_ALIGNMENT_SUFFIXES = (
+    "_student_chunk_id",
+    "_student_exact_partition_mask",
+)
 
-    Handles the case where logits may be TP-sharded DTensor or regular tensor,
-    and converts them to CP+TP sharded DTensor.
 
-    Args:
-        logits: Logits tensor (may be DTensor or regular tensor)
-        device_mesh: Full device mesh
-        cp_mesh: Context parallel mesh (kept for signature compatibility)
-        sequence_dim: Dimension for sequence sharding
+def _student_seq_aligned_keys(data_dict: BatchedDataDict[Any]) -> list[str]:
+    """Keys of ``data_dict`` that must be CP-sharded alongside the student logits."""
+    keys = [
+        k
+        for k in data_dict
+        if k.startswith("alignment_") and k.endswith(_STUDENT_SEQ_ALIGNMENT_SUFFIXES)
+    ]
+    if keys and "token_mask" in data_dict:
+        keys.append("token_mask")
+    return keys
 
-    Returns:
-        DTensor sharded on both CP and TP dimensions
+
+def _cp_gather_logits(
+    logits: torch.Tensor | DTensor,
+    cp_sharder: Any,
+    seq_dim: int = 1,
+) -> torch.Tensor | DTensor:
+    """Restore CP-local logits to canonical full-sequence order.
+
+    Keeps a tensor-parallel ``DTensor`` a ``DTensor`` on the same vocabulary
+    mesh: only the sequence dimension is reassembled.
     """
     if isinstance(logits, DTensor):
-        # Must be tp sharded
-        assert (
-            logits.device_mesh.ndim == 1
-            and logits.device_mesh.mesh_dim_names[0] == "tp"
-        ), "logits must be tp sharded"
-
-        # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
-        logits = DTensor.from_local(
-            logits.to_local(),
-            device_mesh=device_mesh[("cp", "tp")],
-            placements=[Shard(sequence_dim), Shard(-1)],
+        gathered = cp_sharder.gather_token_tensor(
+            logits.to_local(), seq_dim=seq_dim, trim=True
         )
-    else:
-        logits = DTensor.from_local(
-            logits,
-            device_mesh=device_mesh[("cp", "tp")],
-            placements=[Shard(sequence_dim), Shard(-1)],
+        return DTensor.from_local(
+            gathered,
+            device_mesh=logits.device_mesh,
+            placements=logits.placements,
         )
-    return logits
+    return cp_sharder.gather_token_tensor(logits, seq_dim=seq_dim, trim=True)
 
 
-def prepare_data_for_cp(
-    mb: BatchedDataDict[Any],
+def prepare_cp_forward(
+    model: nn.Module,
+    device_mesh: Any,
     processed_inputs: ProcessedInputs,
-    cp_mesh: Any,
-    sequence_dim: int = 1,
-) -> tuple[torch.Tensor, BatchedDataDict[Any]]:
-    """Prepare data for context parallel processing.
+    *,
+    padding_token_id: int = 0,
+) -> Callable[[], Any]:
+    """Resolve Automodel's CP sharder for this microbatch and shard the model batch.
 
-    Converts seq_index to full tensor and wraps CP-sharded tensors in DTensor.
+    Automodel owns the whole context-parallel layout: padding to its CP divisor,
+    load balancing, model-specific ``prepare_model_inputs_for_cp`` hooks, and the
+    attention transport. NeMo-RL only hands it a private model batch and keeps the
+    resulting sharder so the loss side can map token-aligned tensors through the
+    same :class:`ShardLayout`.
+
+    The model batch is cloned because the caller's ``data_dict["input_ids"]``
+    aliases ``processed_inputs.input_ids``, and the loss side must keep the
+    canonical full sequence while the model batch gets padded and sharded.
 
     Args:
-        mb: Microbatch data dictionary
-        processed_inputs: Processed inputs containing CP buffers
-        cp_mesh: Context parallel mesh
-        sequence_dim: Dimension for sequence sharding
+        model: The live (parallelized) model; its CP hook and attention backend
+            select the sharding strategy.
+        device_mesh: The full device mesh; Automodel reads its ``cp``/``tp`` axes.
+        processed_inputs: Microbatch inputs. ``input_ids``, ``position_ids`` and
+            ``cp_sharder`` are replaced in place with the sharded model batch.
+        padding_token_id: Pad sentinel for ``input_ids``.
 
     Returns:
-        Tuple of (seq_index_dtensor, updated_mb)
+        The forward context factory; entering it installs the CP attention
+        context and performs the in-place shard of the integer buffers.
     """
-    seq_index_dtensor = (
-        DTensor.from_local(
-            processed_inputs.seq_index,
-            device_mesh=cp_mesh,
-            placements=[Shard(1)],
-        )
-        .full_tensor()
-        .squeeze(0)
+    model_batch: dict[str, Any] = {
+        "input_ids": processed_inputs.input_ids.clone(),
+        "position_ids": processed_inputs.position_ids.clone(),
+        # The sharder uses ``labels`` to identify the primary token stream and to
+        # size the layout. GRPO never uses the model's own LM loss, so this is a
+        # structural input only and is dropped before the forward.
+        "labels": torch.full_like(processed_inputs.input_ids, -100),
+    }
+
+    cp_sharder = ContextParallelSharder(
+        model=model,
+        device_mesh=device_mesh,
+        batch=model_batch,
+        padding_token_id=padding_token_id,
     )
+    model_context_factory, model_batch = cp_sharder.shard(model_batch)
 
-    mb["seq_index"] = seq_index_dtensor
+    if "inputs_embeds" in model_batch:
+        raise NotImplementedError(
+            "Context-parallel sharders that hand back pre-embedded inputs are not "
+            "supported by the automodel policy worker yet; the forward only "
+            "consumes input_ids."
+        )
 
-    for tensor_name in mb:
-        current_tensor = mb[tensor_name]
-        for buffer in processed_inputs.cp_buffers:
-            if current_tensor is buffer:
-                assert type(current_tensor) == torch.Tensor, (
-                    f"tensor {tensor_name} is not a tensor"
-                )
-                mb[tensor_name] = DTensor.from_local(
-                    current_tensor,
-                    device_mesh=cp_mesh,
-                    placements=[Shard(sequence_dim)],
-                )
-                break
+    # Read the (possibly padded) tensors back before entering the context: the
+    # actual in-place shard happens on context entry, and the forward must see
+    # the same objects the CP context registered.
+    processed_inputs.input_ids = model_batch["input_ids"]
+    processed_inputs.position_ids = model_batch["position_ids"]
+    processed_inputs.cp_sharder = cp_sharder
+    return model_context_factory
 
-    return seq_index_dtensor, mb
+
+@contextlib.contextmanager
+def get_train_context(
+    model: nn.Module,
+    device_mesh: Any,
+    cp_size: int,
+    processed_inputs: ProcessedInputs,
+    dtype: torch.dtype,
+    padding_token_id: int = 0,
+    autocast_enabled: bool = True,
+) -> Generator[None, None, None]:
+    """Combined forward context: Automodel's CP context plus autocast."""
+    with contextlib.ExitStack() as stack:
+        if cp_size > 1:
+            model_context_factory = prepare_cp_forward(
+                model,
+                device_mesh,
+                processed_inputs,
+                padding_token_id=padding_token_id,
+            )
+            stack.enter_context(model_context_factory())
+        else:
+            stack.enter_context(get_train_context_automodel(False, False, None)())
+        if autocast_enabled:
+            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
+        yield
 
 
 def forward_with_post_processing_fn(
@@ -503,8 +556,20 @@ def automodel_forward_backward(
                     ## from affecting the gradient calculation
 
                     # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                    # but we want to sum them so we cancel out the average here
-                    loss = result * dp_size * cp_size
+                    # but we want to sum them so we cancel out the average here.
+                    #
+                    # The CP factor is deliberately not applied when CP is active:
+                    # every CP rank holds the same replicated full-sequence loss,
+                    # and the differentiable gather that produced it
+                    # (ContextParallelSharder.gather_token_tensor ->
+                    # torch.distributed.nn.functional.all_gather, whose backward is
+                    # a summing reduce_scatter) has already fanned those cp_size
+                    # identical loss consumers into each local shard's gradient.
+                    # Multiplying by cp_size again would scale CP gradients by
+                    # cp_size relative to the cp_size == 1 result.
+                    loss = (
+                        result * dp_size if cp_size > 1 else result * dp_size * cp_size
+                    )
                     loss.backward()
 
         results.append((result, metrics))
@@ -572,18 +637,38 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
-        # Handle CP redistribution
-        if self.cp_size > 1:
-            _, data_dict = prepare_data_for_cp(
-                data_dict, processed_inputs, self.cp_mesh, sequence_dim
-            )
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
-            )
+        # Under CP, ``logits`` is this rank's local shard while ``data_dict``
+        # stays canonical; the sharder maps between the two.
+        cp_sharder = processed_inputs.cp_sharder if self.cp_size > 1 else None
+        if cp_sharder is not None:
+            input_type = self.loss_fn.input_type
+            if input_type == LossInputType.LOGPROB:
+                # Cross-tokenizer student-sequence fields used to ride the CP
+                # buffer list, so map them through the very same layout here.
+                for key in _student_seq_aligned_keys(data_dict):
+                    data_dict[key] = cp_sharder.shard_token_tensor(
+                        data_dict[key], seq_dim=sequence_dim, fill=0
+                    )
+            elif input_type == LossInputType.LOGIT:
+                # Logit losses (value-head MSE, DPO) consume full-sequence logits
+                # against the canonical data_dict, so restore canonical order here
+                # while keeping any vocabulary (TP) sharding intact.
+                logits = _cp_gather_logits(logits, cp_sharder, sequence_dim)
+            else:
+                raise NotImplementedError(
+                    f"Loss input type {input_type} is not supported with "
+                    "context_parallel_size > 1 on the automodel policy worker. "
+                    "Its loss path still derives the CP layout itself (see "
+                    "nemo_rl/algorithms/x_token/loss_utils.py) instead of using "
+                    "Automodel's ContextParallelSharder; set "
+                    "dtensor_cfg.context_parallel_size=1 until it is migrated."
+                )
 
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input,
+            sampling_params=self.sampling_params,
+            cp_sharder=cp_sharder,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
@@ -668,40 +753,25 @@ class LogprobsPostProcessor:
         Returns:
             Token log probabilities tensor [batch_size, seq_length]
         """
-        seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
 
         if self.cp_size > 1:
-            seq_index_tensor = (
-                DTensor.from_local(
-                    processed_inputs.seq_index,
-                    device_mesh=self.cp_mesh,
-                    placements=[Shard(1)],
-                )
-                .full_tensor()
-                .squeeze(0)
-            )
-
-            input_ids_dtensor = DTensor.from_local(
-                processed_inputs.input_ids,
-                device_mesh=self.cp_mesh,
-                placements=[Shard(sequence_dim)],
-            )
-
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
-            )
-
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
+            # ``processed_inputs.input_ids`` is the CP-local (and possibly padded)
+            # shard once the forward context is entered, so the canonical
+            # sequence has to come from the untouched microbatch data.
+            canonical_input_ids = data_dict["input_ids"]
+            seq_len = canonical_input_ids.shape[1]
+            token_logprobs = get_cp_sharded_next_token_logprobs(
                 logits,
-                input_ids_dtensor,
-                seq_index_tensor,
+                canonical_input_ids,
+                processed_inputs.cp_sharder,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
             )
 
             assert token_logprobs.shape[1] == seq_len - 1
         else:
+            seq_len = processed_inputs.seq_len
             if isinstance(logits, DTensor):
                 # DTensor path with TP sharding
                 token_logprobs = get_logprobs_from_vocab_parallel_logits(
@@ -881,12 +951,8 @@ class TopkLogitsPostProcessor:
         input_lengths = data_dict["input_lengths"]
 
         if self.cp_size > 1:
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
-            )
-
-            # Deal with TP first
-            local_logits = logits.to_local()  # [B, S_cp, V_tp]
+            # Deal with TP first; the logits are already this rank's CP shard.
+            local_logits = to_local_if_dtensor(logits)  # [B, S_cp, V_tp]
 
             tp_group = self.tp_mesh.get_group()
             tp_rank = torch.distributed.get_rank(tp_group)
@@ -903,10 +969,10 @@ class TopkLogitsPostProcessor:
             )
             # [B, S_cp, k]
 
-            cp_group = self.cp_mesh.get_group()
-
-            vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
-            idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
+            # Automodel's layout restores canonical order and trims its CP padding.
+            cp_sharder = processed_inputs.cp_sharder
+            vals = cp_sharder.gather_token_tensor(vals, seq_dim=sequence_dim, trim=True)
+            idx = cp_sharder.gather_token_tensor(idx, seq_dim=sequence_dim, trim=True)
             # [B, S, k]
         else:
             # Compute top-k over full sequence length
@@ -1010,15 +1076,21 @@ class FullLogitsPostProcessor:
         # projection (KL math), and a dtype-consistent IPC buffer producer<->consumer.
         logits = logits.to(torch.float32)
 
-        # context_parallel shards the seq dim load-balanced (interleaved), but the
-        # IPC consumer routes by contiguous ``global_seq_start`` over the teacher CP
-        # group. Restore global order and emit this rank's contiguous slice, else
-        # heterogeneous teacher_cp != student_cp lands teacher data at the wrong
-        # seq positions in the consumer's dest tensor.
+        # Automodel's CP layout is not contiguous per rank, but the IPC consumer
+        # routes by contiguous ``global_seq_start`` over the teacher CP group.
+        # Restore canonical order (trimming Automodel's CP padding) and emit this
+        # rank's contiguous slice, else heterogeneous teacher_cp != student_cp
+        # lands teacher data at the wrong seq positions in the consumer's dest
+        # tensor.
         if self.cp_size > 1 and self.cp_mesh is not None:
-            logits = cp_load_balanced_to_contiguous(
-                logits, cp_group=self.cp_mesh.get_group(), seq_dim=sequence_dim
+            full = processed_inputs.cp_sharder.gather_token_tensor(
+                logits, seq_dim=sequence_dim, trim=True
             )
+            local_len = full.shape[sequence_dim] // self.cp_size
+            cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
+            logits = full.narrow(
+                sequence_dim, cp_rank * local_len, local_len
+            ).contiguous()
         return logits  # [B, S_local_contiguous, V_t]
 
 

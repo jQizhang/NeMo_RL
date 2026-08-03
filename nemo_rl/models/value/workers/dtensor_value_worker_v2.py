@@ -12,20 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Optional
 
 import ray
 import torch
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    create_context_parallel_ctx,
-)
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    get_train_context as get_train_context_automodel,
-)
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from transformers import (
@@ -51,6 +44,7 @@ from nemo_rl.models.automodel.train import (
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
+    get_train_context,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -91,35 +85,6 @@ class RightShiftLossWrapper:
         # (input_type, aggregation_type, etc.) delegates to the wrapped
         # loss function.
         return getattr(self._inner, name)
-
-
-@contextlib.contextmanager
-def get_train_context(
-    cp_size: int,
-    cp_mesh: Any,
-    cp_buffers: list,
-    sequence_dim: int,
-    dtype: torch.dtype,
-    autocast_enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Create combined context manager for training with context parallel and autocast."""
-    with contextlib.ExitStack() as stack:
-        context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=cp_mesh,
-                cp_buffers=cp_buffers,
-                cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                cp_no_restore_buffers=set(cp_buffers),
-            )
-
-        stack.enter_context(
-            get_train_context_automodel(False, False, context_parallel_ctx)()
-        )
-        if autocast_enabled:
-            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
-        yield
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -313,11 +278,12 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         # Create train context factory
         def train_context_fn(processed_inputs):
             return get_train_context(
+                model=self.model,
+                device_mesh=self.device_mesh,
                 cp_size=self.cp_size,
-                cp_mesh=self.cp_mesh,
-                cp_buffers=processed_inputs.cp_buffers,
-                sequence_dim=sequence_dim,
+                processed_inputs=processed_inputs,
                 dtype=self.dtype,
+                padding_token_id=self.tokenizer.pad_token_id or 0,
                 autocast_enabled=self.autocast_enabled,
             )
 
@@ -480,11 +446,12 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                 processed_inputs = processed_mb.processed_inputs
 
                 with get_train_context(
+                    model=self.model,
+                    device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
+                    processed_inputs=processed_inputs,
                     dtype=self.dtype,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass.
