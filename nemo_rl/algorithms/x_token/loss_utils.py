@@ -42,13 +42,11 @@ from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
-from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
-    cp_shift_next,
-    get_logprobs_from_vocab_parallel_logits,
+    ResolvedVocabParallelLogits,
+    get_target_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
     vocab_parallel_argmax,
 )
@@ -259,15 +257,14 @@ def select_teacher_topk_indices(
         return top_indices.sort().values
 
 
-@dataclass
+@dataclass(frozen=True)
 class LocalizedAlignment:
     """CP-localized alignment tensors consumed by the loss reductions.
 
     For a cross-tokenizer teacher every field is populated (chunk-averaged
-    projection KL / gold path). For a same-tokenizer teacher (no projection,
-    identity 1:1 token alignment) the chunk/pair fields stay ``None``: its KD
-    term reads only the shared student fields (``student_input_ids`` /
-    ``student_token_mask`` / ``sample_mask``).
+    projection KL / gold path and teacher-local scoring). For a same-tokenizer
+    teacher only ``sample_mask`` is populated; shared student tensors stay in
+    the top-level loss contract.
     """
 
     sample_mask: torch.Tensor
@@ -275,137 +272,115 @@ class LocalizedAlignment:
     teacher_chunk_id: Optional[torch.Tensor] = None
     pair_valid: Optional[torch.Tensor] = None
     pair_is_correct: Optional[torch.Tensor] = None
-    # Filled post-construction by prepare_xtoken_cross_tokenizer_loss_input: the
-    # CP-relaid contiguous student input_ids / token_mask shared by the
-    # next-token-accuracy metric and the same-tokenizer KD path.
-    student_input_ids: Optional[torch.Tensor] = None
-    student_token_mask: Optional[torch.Tensor] = None
+    teacher_token_mask: Optional[torch.Tensor] = None
+    teacher_next_token_ids: Optional[torch.Tensor] = None
+    teacher_next_token_mask: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        """Validate the self-contained same-vocab or cross-vocab shape contract."""
+        if self.sample_mask.ndim != 1:
+            raise ValueError(
+                f"sample_mask must be one-dimensional, got {self.sample_mask.shape}."
+            )
+        alignment_fields = {
+            "student_chunk_id": self.student_chunk_id,
+            "teacher_chunk_id": self.teacher_chunk_id,
+            "pair_valid": self.pair_valid,
+            "pair_is_correct": self.pair_is_correct,
+            "teacher_token_mask": self.teacher_token_mask,
+            "teacher_next_token_ids": self.teacher_next_token_ids,
+            "teacher_next_token_mask": self.teacher_next_token_mask,
+        }
+        present = [
+            name for name, value in alignment_fields.items() if value is not None
+        ]
+        if not present:
+            return
+        missing = [name for name, value in alignment_fields.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Cross-tokenizer alignment fields must be populated together; "
+                f"missing {missing}."
+            )
+
+        assert self.student_chunk_id is not None
+        assert self.teacher_chunk_id is not None
+        assert self.pair_valid is not None
+        assert self.pair_is_correct is not None
+        assert self.teacher_token_mask is not None
+        assert self.teacher_next_token_ids is not None
+        assert self.teacher_next_token_mask is not None
+        batch_size = self.sample_mask.shape[0]
+        tensors = {
+            "student_chunk_id": self.student_chunk_id,
+            "teacher_chunk_id": self.teacher_chunk_id,
+            "pair_valid": self.pair_valid,
+            "pair_is_correct": self.pair_is_correct,
+            "teacher_token_mask": self.teacher_token_mask,
+            "teacher_next_token_ids": self.teacher_next_token_ids,
+            "teacher_next_token_mask": self.teacher_next_token_mask,
+        }
+        for name, tensor in tensors.items():
+            if tensor.ndim != 2 or tensor.shape[0] != batch_size:
+                raise ValueError(
+                    f"{name} must have shape [B, S] with B={batch_size}, got "
+                    f"{tensor.shape}."
+                )
+        if self.pair_valid.shape != self.pair_is_correct.shape:
+            raise ValueError(
+                "pair_valid and pair_is_correct must have identical shapes, got "
+                f"{self.pair_valid.shape} and {self.pair_is_correct.shape}."
+            )
+        teacher_shape = self.teacher_chunk_id.shape
+        for name, tensor in (
+            ("teacher_token_mask", self.teacher_token_mask),
+            ("teacher_next_token_ids", self.teacher_next_token_ids),
+            ("teacher_next_token_mask", self.teacher_next_token_mask),
+        ):
+            if tensor.shape != teacher_shape:
+                raise ValueError(
+                    f"{name} must match teacher_chunk_id shape {teacher_shape}, "
+                    f"got {tensor.shape}."
+                )
 
 
-def localize_alignment(
-    data: Mapping[str, Any],
-    *,
-    teacher_seq_len: int,
-    alignment_prefix: str = "alignment_",
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> LocalizedAlignment:
-    """Localize the chunk-alignment data-dict fields for the local CP shard.
-
-    Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
-    their local tensors. Student-seq fields (``student_chunk_id``) come from
-    ``cp_buffers`` in PyTorch's *load-balanced* (``2*cp`` interleaved) CP layout,
-    not contiguous — the caller
-    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) must relayout them to this
-    rank's contiguous window via :func:`cp_load_balanced_to_contiguous` before use.
-    The teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
-    this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
-    contiguous teacher-logit slice.
-
-    Args:
-        alignment_prefix: Data-dict key prefix for this teacher's alignment
-            tensors (``"alignment_"`` single-teacher, ``"alignment_{i}_"`` per
-            teacher in the multi-teacher trainer / collator). ``sample_mask`` is
-            student-level and stays unprefixed.
-    """
-    teacher_chunk_id_full = to_local_if_dtensor(
-        data[f"{alignment_prefix}teacher_chunk_id"]
-    )
-    cp_rank = (
-        torch.distributed.get_rank(cp_group)
-        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
-        else 0
-    )
-    teacher_seq_start = cp_rank * teacher_seq_len
-    teacher_chunk_id = teacher_chunk_id_full[
-        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
-    ]
-    return LocalizedAlignment(
-        sample_mask=to_local_if_dtensor(data["sample_mask"]),
-        student_chunk_id=to_local_if_dtensor(
-            data[f"{alignment_prefix}student_chunk_id"]
-        ),
-        teacher_chunk_id=teacher_chunk_id,
-        pair_valid=to_local_if_dtensor(data[f"{alignment_prefix}pair_valid"]),
-        pair_is_correct=to_local_if_dtensor(data[f"{alignment_prefix}pair_is_correct"]),
-    )
-
-
-def student_next_token_ce(
+def aligned_next_token_accuracy(
     logits: torch.Tensor,
     *,
-    input_ids: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
+    target_ids: torch.Tensor,
+    target_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    dp_group: Optional[torch.distributed.ProcessGroup],
 ) -> torch.Tensor:
-    """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
-
-    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
-    (which also handles the CP roll); plain logits use a local shifted
-    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
-    convention the KL terms use.
-    """
-    if isinstance(logits, DTensor):
-        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            logits, input_ids, seq_index=seq_index
+    """Compute top-1 accuracy from already aligned local predictor targets."""
+    target_ids = to_local_if_dtensor(target_ids).to(logits.device)
+    target_mask = to_local_if_dtensor(target_mask).to(logits.device)
+    sample_mask = to_local_if_dtensor(sample_mask).to(logits.device)
+    expected = tuple(logits.shape[:2])
+    if tuple(target_ids.shape) != expected or tuple(target_mask.shape) != expected:
+        raise ValueError(
+            "Aligned accuracy targets must match the logits [B, S] prefix, got "
+            f"logits={logits.shape}, ids={target_ids.shape}, mask={target_mask.shape}."
         )
-        return -next_token_logprobs
-    shift_logits = logits[:, :-1].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    return torch.nn.functional.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
-        shift_labels.reshape(-1),
-        reduction="none",
-    ).reshape(shift_labels.shape)
+    if target_ids.dtype != torch.long:
+        raise TypeError(
+            f"target_ids must have dtype torch.long, got {target_ids.dtype}."
+        )
+    if sample_mask.ndim != 1 or sample_mask.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"sample_mask must have shape [{logits.shape[0]}], got {sample_mask.shape}."
+        )
 
-
-def ce_label_mask(
-    *,
-    token_mask: torch.Tensor,
-    sample_mask: torch.Tensor,
-    ce_seq_len: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Next-token label mask ``[B, ce_seq_len]`` = shifted token_mask * sample_mask.
-
-    ``token_mask`` is gathered to the full sequence (CP) before the shift; both
-    inputs are DTensor-unwrapped.
-    """
-    token_mask = (
-        token_mask.full_tensor() if isinstance(token_mask, DTensor) else token_mask
-    )
-    sample_mask = to_local_if_dtensor(sample_mask)
-    return (token_mask[:, 1 : ce_seq_len + 1] * sample_mask.unsqueeze(-1)).to(dtype)
-
-
-def next_token_accuracy(
-    logits: torch.Tensor,
-    *,
-    input_ids: torch.Tensor,
-    token_mask: torch.Tensor,
-    sample_mask: torch.Tensor,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> torch.Tensor:
-    """Masked next-token top-1 accuracy of the student (scalar, no gradient).
-
-    Uses :func:`vocab_parallel_argmax` for the (possibly TP-sharded) argmax. The
-    next-token shift on labels/mask is CP-aware (:func:`cp_shift_next`) so the
-    boundary token crosses CP ranks, and the correct/total counts are CP-reduced
-    so every rank reports the same global accuracy.
-    """
     with torch.no_grad():
         argmax = vocab_parallel_argmax(logits, tp_group=tp_group)
-        next_labels = cp_shift_next(to_local_if_dtensor(input_ids), cp_group, fill=0)
-        next_mask = cp_shift_next(to_local_if_dtensor(token_mask), cp_group, fill=0)
-        acc_mask = (
-            next_mask.float() * to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
-        )
-        correct = ((argmax == next_labels).float() * acc_mask).sum()
-        denom = acc_mask.sum()
-        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
-            stats = torch.stack([correct, denom])
-            torch.distributed.all_reduce(stats, group=cp_group)
-            correct, denom = stats[0], stats[1]
-        return correct / denom.clamp(min=1.0)
+        mask = target_mask.float() * sample_mask.unsqueeze(-1).float()
+        stats = torch.stack([((argmax == target_ids).float() * mask).sum(), mask.sum()])
+        for group in (cp_group, dp_group):
+            if group is not None:
+                torch.distributed.all_reduce(stats, group=group)
+        return stats[0] / stats[1].clamp(min=1.0)
 
 
 def collect_overlapping_teacher_shards(
@@ -446,6 +421,229 @@ def collect_overlapping_teacher_shards(
         dest_vocab = slice(teacher_vocab_start, teacher_vocab_end)
         matches.append((handle, src_seq, src_vocab, dest_seq, dest_vocab))
     return matches
+
+
+def _teacher_ipc_window_coordinates(
+    per_sample_entries: list[dict[str, Any]],
+    *,
+    student_cp_rank: int,
+    student_cp_size: int,
+) -> tuple[int, int, int]:
+    """Resolve one student's contiguous teacher window from validated IPC metadata."""
+    if not per_sample_entries:
+        raise ValueError("Teacher IPC entries must be non-empty.")
+    if student_cp_size <= 0 or not 0 <= student_cp_rank < student_cp_size:
+        raise ValueError(
+            f"Invalid student CP topology: rank={student_cp_rank}, size={student_cp_size}."
+        )
+
+    first_shards = per_sample_entries[0].get("teacher_shards")
+    if not first_shards:
+        raise ValueError("Every teacher IPC sample must contain teacher_shards.")
+    full_seq_len = int(first_shards[0]["full_seq_len"])
+    full_vocab_size = int(first_shards[0]["full_vocab_size"])
+    if full_seq_len <= 0 or full_vocab_size <= 0:
+        raise ValueError(
+            f"Invalid teacher IPC shape: T={full_seq_len}, V={full_vocab_size}."
+        )
+    if full_seq_len % student_cp_size != 0:
+        raise ValueError(
+            "Teacher sequence length must be divisible by the student CP size, "
+            f"got T={full_seq_len}, CP={student_cp_size}."
+        )
+    local_seq_len = full_seq_len // student_cp_size
+    global_seq_start = student_cp_rank * local_seq_len
+    return global_seq_start, local_seq_len, full_seq_len
+
+
+def _resolve_teacher_ipc_window(
+    per_sample_entries: list[dict[str, Any]],
+    *,
+    student_cp_rank: int,
+    student_cp_size: int,
+) -> tuple[int, int, int]:
+    """Resolve and fully validate one student's contiguous teacher IPC window."""
+    global_seq_start, local_seq_len, full_seq_len = _teacher_ipc_window_coordinates(
+        per_sample_entries,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
+    )
+    first_shards = per_sample_entries[0]["teacher_shards"]
+    full_vocab_size = int(first_shards[0]["full_vocab_size"])
+
+    for sample_idx, entry in enumerate(per_sample_entries):
+        shards = entry.get("teacher_shards")
+        if not shards:
+            raise ValueError(f"Teacher IPC sample {sample_idx} has no shards.")
+        for shard in shards:
+            if (
+                int(shard["full_seq_len"]) != full_seq_len
+                or int(shard["full_vocab_size"]) != full_vocab_size
+            ):
+                raise ValueError(
+                    f"Teacher IPC sample {sample_idx} has inconsistent global shape."
+                )
+        matches = collect_overlapping_teacher_shards(
+            shards,
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            full_seq_len=full_seq_len,
+        )
+        rectangles: list[tuple[int, int, int, int]] = []
+        covered_area = 0
+        for _, _, _, dest_seq, dest_vocab in matches:
+            seq_start = int(dest_seq.start or 0)
+            seq_end = int(dest_seq.stop or 0)
+            vocab_start = int(dest_vocab.start or 0)
+            vocab_end = int(dest_vocab.stop or 0)
+            rectangles.append((seq_start, seq_end, vocab_start, vocab_end))
+            covered_area += (seq_end - seq_start) * (vocab_end - vocab_start)
+        for index, lhs in enumerate(rectangles):
+            for rhs in rectangles[index + 1 :]:
+                if max(lhs[0], rhs[0]) < min(lhs[1], rhs[1]) and max(
+                    lhs[2], rhs[2]
+                ) < min(lhs[3], rhs[3]):
+                    raise ValueError(
+                        f"Teacher IPC sample {sample_idx} has overlapping window "
+                        f"coverage: {lhs} and {rhs}."
+                    )
+        expected_area = local_seq_len * full_vocab_size
+        if covered_area != expected_area:
+            raise ValueError(
+                f"Teacher IPC sample {sample_idx} covers area {covered_area}, "
+                f"expected {expected_area} for the requested student window."
+            )
+    return global_seq_start, local_seq_len, full_seq_len
+
+
+def validate_xtoken_window_contract(
+    data: Mapping[str, Any],
+    *,
+    projection_matrix_paths: list[Optional[str]],
+    student_seq_len: int,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> None:
+    """Validate equal student and teacher windows before student forward."""
+    if not projection_matrix_paths:
+        raise ValueError("x-token requires at least one teacher.")
+    cp_rank = (
+        torch.distributed.get_rank(context_parallel_group)
+        if context_parallel_group is not None
+        else 0
+    )
+    cp_size = (
+        torch.distributed.get_world_size(context_parallel_group)
+        if context_parallel_group is not None
+        else 1
+    )
+    if student_seq_len <= 0 or student_seq_len % cp_size != 0:
+        raise ValueError(
+            "x-token requires the canonical student sequence length to be "
+            f"positive and divisible by CP size, got T={student_seq_len}, CP={cp_size}."
+        )
+    student_batch_size = int(data["input_ids"].shape[0])
+    for i, projection_path in enumerate(projection_matrix_paths):
+        key = f"teacher_{i}_full_logits_ipc"
+        if key not in data:
+            raise KeyError(f"Missing x-token teacher IPC field {key!r}.")
+        if len(data[key]) != student_batch_size:
+            raise ValueError(
+                f"Teacher {i} IPC entries must match student batch size "
+                f"{student_batch_size}, got {len(data[key])}."
+            )
+        _, _, teacher_full_seq_len = _resolve_teacher_ipc_window(
+            data[key], student_cp_rank=cp_rank, student_cp_size=cp_size
+        )
+        if projection_path is None:
+            if teacher_full_seq_len != student_seq_len:
+                raise ValueError(
+                    f"Same-vocabulary teacher {i} must use the student sequence "
+                    f"length {student_seq_len}, got {teacher_full_seq_len}."
+                )
+            continue
+        required = (
+            f"teacher_{i}_input_ids",
+            f"teacher_{i}_token_mask",
+            f"alignment_{i}_student_chunk_id",
+            f"alignment_{i}_teacher_chunk_id",
+            f"alignment_{i}_pair_valid",
+            f"alignment_{i}_pair_is_correct",
+        )
+        missing = [name for name in required if name not in data]
+        if missing:
+            raise KeyError(f"Teacher {i} is missing x-token fields: {missing}.")
+        teacher_ids = to_local_if_dtensor(data[required[0]])
+        teacher_mask = to_local_if_dtensor(data[required[1]])
+        teacher_shape = (student_batch_size, teacher_full_seq_len)
+        if (
+            tuple(teacher_ids.shape) != teacher_shape
+            or tuple(teacher_mask.shape) != teacher_shape
+        ):
+            raise ValueError(
+                f"Teacher {i} IDs/mask must have shape {teacher_shape}, got "
+                f"{teacher_ids.shape} and {teacher_mask.shape}."
+            )
+        if teacher_ids.dtype != torch.long:
+            raise TypeError(
+                f"Teacher {i} input IDs must have dtype torch.long, got "
+                f"{teacher_ids.dtype}."
+            )
+        full_vocab_size = int(data[key][0]["teacher_shards"][0]["full_vocab_size"])
+        if teacher_ids.numel() > 0:
+            min_id = int(teacher_ids.min().item())
+            max_id = int(teacher_ids.max().item())
+            if min_id < 0 or max_id >= full_vocab_size:
+                raise ValueError(
+                    f"Teacher {i} token IDs are outside [0, {full_vocab_size}): "
+                    f"min={min_id}, max={max_id}."
+                )
+        student_chunks = to_local_if_dtensor(data[required[2]])
+        teacher_chunks = to_local_if_dtensor(data[required[3]])
+        if tuple(student_chunks.shape) != (student_batch_size, student_seq_len):
+            raise ValueError(
+                f"Teacher {i} student chunk IDs must have shape "
+                f"{(student_batch_size, student_seq_len)}, got {student_chunks.shape}."
+            )
+        if tuple(teacher_chunks.shape) != teacher_shape:
+            raise ValueError(
+                f"Teacher {i} teacher chunk IDs must have shape {teacher_shape}, "
+                f"got {teacher_chunks.shape}."
+            )
+        pair_valid = to_local_if_dtensor(data[required[4]])
+        pair_correct = to_local_if_dtensor(data[required[5]])
+        if (
+            pair_valid.ndim != 2
+            or pair_valid.shape != pair_correct.shape
+            or pair_valid.shape[0] != student_batch_size
+        ):
+            raise ValueError(
+                f"Teacher {i} pair masks must have matching [B, C] shapes, got "
+                f"{pair_valid.shape} and {pair_correct.shape}."
+            )
+        if pair_valid.dtype != torch.bool or pair_correct.dtype != torch.bool:
+            raise TypeError(
+                f"Teacher {i} pair masks must have dtype torch.bool, got "
+                f"{pair_valid.dtype} and {pair_correct.dtype}."
+            )
+        if student_chunks.dtype != torch.long or teacher_chunks.dtype != torch.long:
+            raise TypeError(
+                f"Teacher {i} chunk IDs must have dtype torch.long, got "
+                f"{student_chunks.dtype} and {teacher_chunks.dtype}."
+            )
+        max_chunks = int(pair_valid.shape[1])
+        for name, chunks in (
+            ("student", student_chunks),
+            ("teacher", teacher_chunks),
+        ):
+            if chunks.numel() == 0:
+                continue
+            min_chunk = int(chunks.min().item())
+            max_chunk = int(chunks.max().item())
+            if min_chunk < -1 or max_chunk >= max_chunks:
+                raise ValueError(
+                    f"Teacher {i} {name} chunk IDs must lie in "
+                    f"[-1, {max_chunks}), got min={min_chunk}, max={max_chunk}."
+                )
 
 
 def assemble_teacher_logits_from_shards(
@@ -578,6 +776,11 @@ def rebuild_teacher_full_logits_from_ipc(
     )
     student_cp_size = (
         torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
+    _resolve_teacher_ipc_window(
+        per_sample_entries,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
     )
 
     # Bypass: when the teacher layout lines up with this student rank (no
@@ -969,104 +1172,330 @@ def build_exact_token_map(
     return result
 
 
-def prepare_xtoken_cross_tokenizer_loss_input(
-    logits: torch.Tensor,
+def _prepare_xtoken_teacher_window_loss_inputs(
     data: Mapping[str, Any],
     *,
+    student_seq_start: int,
+    student_seq_len: int,
+    student_cp_rank: int,
+    student_cp_size: int,
     projection_matrix_paths: list[Optional[str]],
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> tuple[
-    torch.Tensor,
-    Dict[int, torch.Tensor],
-    Dict[int, LocalizedAlignment],
-    Optional[torch.distributed.ProcessGroup],
-    Optional[torch.distributed.ProcessGroup],
-]:
-    """Build the per-teacher cross-tokenizer distillation loss pieces from student logits + IPC teacher data.
-
-    Rebuilds each teacher's full-vocab logits from its per-rank CUDA IPC handles
-    (``teacher_{i}_full_logits_ipc``) and does the shared CP-resolution the loss
-    needs. The contiguous student logits / input_ids / token_mask are relaid once
-    and shared across teachers. Per teacher, a localized alignment is built: a
-    cross-tokenizer teacher (``projection_matrix_paths[i]`` set) gets the
-    localized, next-token-shifted chunk alignment from its ``alignment_{i}_*``
-    keys; a same-tokenizer teacher (``None`` path) gets a thin alignment carrying
-    only the shared student fields (identity 1:1 token alignment, no chunks).
-    TP/CP groups come from the student ``logits``' device mesh, falling back to
-    the passed groups for non-DTensor logits.
-
-    Args:
-        projection_matrix_paths: Per-teacher projection paths. Its length is the
-            teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
-            keys read here; a ``None`` entry marks a same-tokenizer teacher.
-
-    Returns:
-        ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
-    """
-    if isinstance(logits, DTensor):
-        mesh = logits.device_mesh
-        mesh_names = mesh.mesh_dim_names or ()
-        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
-        tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
-    else:
-        cp_group = context_parallel_group
-        tp_group = vocab_parallel_group
-
-    device = torch.cuda.current_device()
-
-    # Student CP-relay computed once and shared by every teacher's KD term and
-    # the next-token-accuracy metric. Relaid from CP load-balanced to this rank's
-    # contiguous window; input_ids / token_mask stay unshifted (the accuracy
-    # metric and the same-vocab KD apply their own CP-aware next-token shift).
-    student_logits_contig = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
-    student_input_ids = cp_load_balanced_to_contiguous(
-        data["input_ids"], cp_group=cp_group
-    )
-    student_token_mask = cp_load_balanced_to_contiguous(
-        data["token_mask"], cp_group=cp_group
-    )
-    sample_mask = to_local_if_dtensor(data["sample_mask"])
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    device: torch.device,
+) -> tuple[Dict[int, torch.Tensor], Dict[int, LocalizedAlignment]]:
+    """Rebuild teacher logits and localize canonical x-token metadata."""
+    if device.type != "cuda":
+        raise ValueError(f"Teacher IPC reconstruction requires CUDA, got {device}.")
+    if student_seq_start < 0 or student_seq_len <= 0:
+        raise ValueError(
+            "Invalid student window: "
+            f"start={student_seq_start}, length={student_seq_len}."
+        )
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    sample_mask = to_local_if_dtensor(data["sample_mask"]).to(device)
+    if sample_mask.ndim != 1:
+        raise ValueError(
+            f"sample_mask must be one-dimensional, got {sample_mask.shape}."
+        )
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
     aligns_by_idx: Dict[int, LocalizedAlignment] = {}
-    for i, proj_path in enumerate(projection_matrix_paths):
-        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-            data[f"teacher_{i}_full_logits_ipc"],
-            cp_group=cp_group,
-            device=device,
-        )
-        teacher_full_logits_by_idx[i] = teacher_full_logits
-        if proj_path is None:
-            # Same-tokenizer teacher: identity token alignment, no chunk
-            # localization. Carry only the shared student fields.
-            aligns_by_idx[i] = LocalizedAlignment(
-                sample_mask=sample_mask,
-                student_input_ids=student_input_ids,
-                student_token_mask=student_token_mask,
+    for i, projection_path in enumerate(projection_matrix_paths):
+        ipc_key = f"teacher_{i}_full_logits_ipc"
+        if ipc_key not in data:
+            raise KeyError(f"Missing x-token teacher IPC field {ipc_key!r}.")
+        entries = data[ipc_key]
+        teacher_seq_start, teacher_seq_len, teacher_full_seq_len = (
+            _teacher_ipc_window_coordinates(
+                entries,
+                student_cp_rank=student_cp_rank,
+                student_cp_size=student_cp_size,
             )
+        )
+        teacher_logits = rebuild_teacher_full_logits_from_ipc(
+            entries,
+            cp_group=context_parallel_group,
+            device=device_index,
+        )
+        if teacher_logits.shape[:2] != (sample_mask.shape[0], teacher_seq_len):
+            raise ValueError(
+                f"Teacher {i} logits have shape {teacher_logits.shape}; expected "
+                f"[{sample_mask.shape[0]}, {teacher_seq_len}, V]."
+            )
+        teacher_full_logits_by_idx[i] = teacher_logits
+        if projection_path is None:
+            aligns_by_idx[i] = LocalizedAlignment(sample_mask=sample_mask)
             continue
-        align = localize_alignment(
-            data,
-            teacher_seq_len=teacher_full_logits.shape[1],
-            alignment_prefix=f"alignment_{i}_",
-            cp_group=cp_group,
+
+        required_keys = (
+            f"teacher_{i}_input_ids",
+            f"teacher_{i}_token_mask",
+            f"alignment_{i}_student_chunk_id",
+            f"alignment_{i}_teacher_chunk_id",
+            f"alignment_{i}_pair_valid",
+            f"alignment_{i}_pair_is_correct",
         )
-        align.student_chunk_id = cp_shift_next(
-            cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
-            cp_group,
-            fill=-1,
+        missing = [key for key in required_keys if key not in data]
+        if missing:
+            raise KeyError(f"Teacher {i} is missing x-token fields: {missing}.")
+
+        teacher_input_ids = to_local_if_dtensor(data[required_keys[0]]).to(device)
+        teacher_token_mask_global = to_local_if_dtensor(data[required_keys[1]]).to(
+            device
         )
-        align.teacher_chunk_id = cp_shift_next(
-            align.teacher_chunk_id, cp_group, fill=-1
+        expected_teacher_shape = (sample_mask.shape[0], teacher_full_seq_len)
+        if (
+            tuple(teacher_input_ids.shape) != expected_teacher_shape
+            or tuple(teacher_token_mask_global.shape) != expected_teacher_shape
+        ):
+            raise ValueError(
+                f"Teacher {i} canonical IDs/mask must have shape "
+                f"{expected_teacher_shape}, got {teacher_input_ids.shape} and "
+                f"{teacher_token_mask_global.shape}."
+            )
+        if teacher_input_ids.dtype != torch.long:
+            raise TypeError(
+                f"Teacher {i} input IDs must have dtype torch.long, got "
+                f"{teacher_input_ids.dtype}."
+            )
+        teacher_next_token_ids_global = teacher_input_ids.roll(-1, dims=1)
+        teacher_next_token_mask_global = teacher_token_mask_global.roll(
+            -1, dims=1
+        ).clone()
+        teacher_next_token_mask_global[:, -1] = 0
+        teacher_seq_end = teacher_seq_start + teacher_seq_len
+
+        student_chunk_id_global = to_local_if_dtensor(data[required_keys[2]]).to(device)
+        if student_chunk_id_global.ndim != 2 or (
+            student_seq_start + student_seq_len > student_chunk_id_global.shape[1]
+        ):
+            raise ValueError(
+                f"Teacher {i} student chunk IDs cannot cover student window "
+                f"[{student_seq_start}, {student_seq_start + student_seq_len}); "
+                f"shape={student_chunk_id_global.shape}."
+            )
+        student_chunk_id_global = student_chunk_id_global.roll(-1, dims=1).clone()
+        student_chunk_id_global[:, -1] = -1
+
+        teacher_chunk_id_global = to_local_if_dtensor(data[required_keys[3]]).to(device)
+        if tuple(teacher_chunk_id_global.shape) != expected_teacher_shape:
+            raise ValueError(
+                f"Teacher {i} chunk IDs must have shape {expected_teacher_shape}, "
+                f"got {teacher_chunk_id_global.shape}."
+            )
+        teacher_chunk_id_global = teacher_chunk_id_global.roll(-1, dims=1).clone()
+        teacher_chunk_id_global[:, -1] = -1
+
+        pair_valid = to_local_if_dtensor(data[required_keys[4]]).to(device)
+        pair_is_correct = to_local_if_dtensor(data[required_keys[5]]).to(device)
+        if (
+            pair_valid.shape != pair_is_correct.shape
+            or pair_valid.shape[0] != sample_mask.shape[0]
+        ):
+            raise ValueError(
+                f"Teacher {i} pair masks must have matching [B, C] shapes, got "
+                f"{pair_valid.shape} and {pair_is_correct.shape}."
+            )
+
+        aligns_by_idx[i] = LocalizedAlignment(
+            sample_mask=sample_mask,
+            student_chunk_id=student_chunk_id_global[
+                :, student_seq_start : student_seq_start + student_seq_len
+            ].contiguous(),
+            teacher_chunk_id=teacher_chunk_id_global[
+                :, teacher_seq_start:teacher_seq_end
+            ].contiguous(),
+            pair_valid=pair_valid,
+            pair_is_correct=pair_is_correct,
+            teacher_token_mask=teacher_token_mask_global[
+                :, teacher_seq_start:teacher_seq_end
+            ].contiguous(),
+            teacher_next_token_ids=teacher_next_token_ids_global[
+                :, teacher_seq_start:teacher_seq_end
+            ].contiguous(),
+            teacher_next_token_mask=teacher_next_token_mask_global[
+                :, teacher_seq_start:teacher_seq_end
+            ].contiguous(),
         )
-        align.student_input_ids = student_input_ids
-        align.student_token_mask = student_token_mask
-        aligns_by_idx[i] = align
-    return (
-        student_logits_contig,
-        teacher_full_logits_by_idx,
-        aligns_by_idx,
-        tp_group,
-        cp_group,
+    return teacher_full_logits_by_idx, aligns_by_idx
+
+
+def prepare_xtoken_window_loss_inputs(
+    student_logits_global_sequence: torch.Tensor,
+    data: Mapping[str, Any],
+    *,
+    vocab: ResolvedVocabParallelLogits,
+    student_tokenizer_vocab_size: int,
+    teacher_tokenizer_vocab_sizes: list[int],
+    projection_matrix_paths: list[Optional[str]],
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    data_parallel_group: Optional[torch.distributed.ProcessGroup],
+    logprob_chunk_size: Optional[int],
+) -> dict[str, Any]:
+    """Build the single supported precomputed x-token loss contract.
+
+    ``student_logits_global_sequence`` is already restored from Automodel's
+    model-owned token layout. This function owns the x-token contiguous-window
+    semantics, global next-token shift, aligned student logprobs, teacher IPC
+    reconstruction, and alignment localization.
+    """
+    if student_logits_global_sequence.ndim != 3:
+        raise ValueError(
+            "Restored student logits must have shape [B, S, V], got "
+            f"{student_logits_global_sequence.shape}."
+        )
+    if len(teacher_tokenizer_vocab_sizes) != len(projection_matrix_paths):
+        raise ValueError(
+            "Teacher tokenizer vocab sizes and projection paths must have equal "
+            f"lengths, got {len(teacher_tokenizer_vocab_sizes)} and "
+            f"{len(projection_matrix_paths)}."
+        )
+    if vocab.global_vocab_size < student_tokenizer_vocab_size:
+        raise ValueError(
+            "The student model output width cannot be smaller than the tokenizer "
+            f"vocabulary: model={vocab.global_vocab_size}, "
+            f"tokenizer={student_tokenizer_vocab_size}."
+        )
+    local_vocab_width = int(student_logits_global_sequence.shape[-1])
+    if local_vocab_width != vocab.vocab_end_index - vocab.vocab_start_index:
+        raise ValueError(
+            "Restored student logits do not match the resolved vocabulary interval: "
+            f"width={local_vocab_width}, interval=[{vocab.vocab_start_index}, "
+            f"{vocab.vocab_end_index})."
+        )
+    if vocab.is_vocab_sharded:
+        if vocab.global_vocab_size % vocab.tp_size != 0:
+            raise ValueError(
+                "x-token requires equal TP vocabulary shards; global vocabulary "
+                f"{vocab.global_vocab_size} is not divisible by TP size "
+                f"{vocab.tp_size}."
+            )
+        expected_width = vocab.global_vocab_size // vocab.tp_size
+        expected_start = vocab.tp_rank * expected_width
+        if (
+            local_vocab_width != expected_width
+            or vocab.vocab_start_index != expected_start
+        ):
+            raise ValueError(
+                "x-token requires equal, rank-ordered TP vocabulary shards; "
+                f"rank {vocab.tp_rank} owns [{vocab.vocab_start_index}, "
+                f"{vocab.vocab_end_index}), expected [{expected_start}, "
+                f"{expected_start + expected_width})."
+            )
+
+    student_cp_rank = (
+        torch.distributed.get_rank(context_parallel_group)
+        if context_parallel_group is not None
+        else 0
     )
+    student_cp_size = (
+        torch.distributed.get_world_size(context_parallel_group)
+        if context_parallel_group is not None
+        else 1
+    )
+    full_sequence_length = int(student_logits_global_sequence.shape[1])
+    if full_sequence_length % student_cp_size != 0:
+        raise ValueError(
+            "x-token requires equal contiguous student CP windows, got sequence "
+            f"length {full_sequence_length} and cp_size {student_cp_size}."
+        )
+    local_sequence_length = full_sequence_length // student_cp_size
+    sequence_start = student_cp_rank * local_sequence_length
+    sequence_end = sequence_start + local_sequence_length
+    student_logits_contig = student_logits_global_sequence[
+        :, sequence_start:sequence_end, :
+    ].contiguous()
+
+    input_ids = to_local_if_dtensor(data["input_ids"]).to(student_logits_contig.device)
+    token_mask = to_local_if_dtensor(data["token_mask"]).to(
+        student_logits_contig.device
+    )
+    if input_ids.shape != token_mask.shape or input_ids.shape != (
+        student_logits_contig.shape[0],
+        full_sequence_length,
+    ):
+        raise ValueError(
+            "x-token input_ids/token_mask must match the restored student sequence, "
+            f"got ids={input_ids.shape}, mask={token_mask.shape}, "
+            f"logits={student_logits_global_sequence.shape}."
+        )
+    next_token_ids = input_ids.roll(-1, dims=1)
+    next_token_mask = token_mask.roll(-1, dims=1).clone()
+    next_token_ids[:, -1] = 0
+    next_token_mask[:, -1] = 0
+    student_token_mask_contig = token_mask[:, sequence_start:sequence_end].contiguous()
+    student_next_token_ids = next_token_ids[:, sequence_start:sequence_end].contiguous()
+    student_next_token_mask = next_token_mask[
+        :, sequence_start:sequence_end
+    ].contiguous()
+    student_next_token_logprobs = get_target_logprobs_from_vocab_parallel_logits(
+        student_logits_contig,
+        student_next_token_ids,
+        tp_group=vocab.vocab_parallel_group,
+        vocab_start_index=vocab.vocab_start_index,
+        vocab_end_index=vocab.vocab_end_index,
+        global_vocab_size=vocab.global_vocab_size,
+        chunk_size=logprob_chunk_size,
+        sampling_params=None,
+        inference_only=False,
+    )
+
+    teacher_full_logits_by_idx, aligns_by_idx = (
+        _prepare_xtoken_teacher_window_loss_inputs(
+            data,
+            student_seq_start=sequence_start,
+            student_seq_len=local_sequence_length,
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            projection_matrix_paths=projection_matrix_paths,
+            context_parallel_group=context_parallel_group,
+            device=student_logits_contig.device,
+        )
+    )
+    student_prefix = tuple(student_logits_contig.shape[:2])
+    for i, projection_path in enumerate(projection_matrix_paths):
+        teacher_logits = teacher_full_logits_by_idx[i]
+        align = aligns_by_idx[i]
+        if teacher_logits.shape[-1] < teacher_tokenizer_vocab_sizes[i]:
+            raise ValueError(
+                f"Teacher {i} model output width {teacher_logits.shape[-1]} is "
+                "smaller than its tokenizer vocabulary "
+                f"{teacher_tokenizer_vocab_sizes[i]}."
+            )
+        if projection_path is None:
+            if tuple(teacher_logits.shape[:2]) != student_prefix:
+                raise ValueError(
+                    f"Same-vocabulary teacher {i} must align one-to-one with "
+                    f"student positions {student_prefix}, got "
+                    f"{tuple(teacher_logits.shape[:2])}."
+                )
+            continue
+        assert align.student_chunk_id is not None
+        assert align.teacher_chunk_id is not None
+        if tuple(align.student_chunk_id.shape) != student_prefix:
+            raise ValueError(
+                f"Teacher {i} student chunk IDs must match {student_prefix}, got "
+                f"{align.student_chunk_id.shape}."
+            )
+        if tuple(align.teacher_chunk_id.shape) != tuple(teacher_logits.shape[:2]):
+            raise ValueError(
+                f"Teacher {i} chunk IDs must match teacher positions "
+                f"{tuple(teacher_logits.shape[:2])}, got "
+                f"{align.teacher_chunk_id.shape}."
+            )
+
+    return {
+        "student_logits_contig": student_logits_contig,
+        "student_output_vocab_size": vocab.global_vocab_size,
+        "student_token_mask_contig": student_token_mask_contig,
+        "student_next_token_logprobs": student_next_token_logprobs,
+        "student_next_token_ids": student_next_token_ids,
+        "student_next_token_mask": student_next_token_mask,
+        "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+        "aligns_by_idx": aligns_by_idx,
+        "tp_group": vocab.vocab_parallel_group,
+        "cp_group": context_parallel_group,
+        "dp_group": data_parallel_group,
+    }

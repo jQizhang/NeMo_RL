@@ -43,7 +43,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     collect_overlapping_teacher_shards,
     get_sparse_projection_matrix,
     get_topk_projection,
-    localize_alignment,
     parse_projection_file,
     valid_chunk_mask,
 )
@@ -442,27 +441,6 @@ class TestBuildExactTokenMap:
 # select_teacher_topk_indices are covered by the real multi-GPU NCCL tests at
 # the bottom of this file (single-rank fallbacks would not exercise any of the
 # collectives).
-class TestLocalizeAlignment:
-    def _data(self, B: int = 2, T_s: int = 5, T_t: int = 6, P: int = 3) -> dict:
-        return {
-            "alignment_student_chunk_id": torch.zeros((B, T_s), dtype=torch.long),
-            "alignment_teacher_chunk_id": torch.arange(B * T_t).reshape(B, T_t),
-            "alignment_pair_valid": torch.ones((B, P), dtype=torch.bool),
-            "alignment_pair_is_correct": torch.zeros((B, P), dtype=torch.bool),
-            "sample_mask": torch.ones(B, dtype=torch.bool),
-        }
-
-    def test_no_cp_keeps_full_teacher_chunk_id(self):
-        data = self._data()
-        align = localize_alignment(data, teacher_seq_len=6, cp_group=None)
-        # cp_group=None → start offset 0, full teacher_chunk_id passed through.
-        assert torch.equal(align.teacher_chunk_id, data["alignment_teacher_chunk_id"])
-        assert torch.equal(align.student_chunk_id, data["alignment_student_chunk_id"])
-        assert torch.equal(align.pair_valid, data["alignment_pair_valid"])
-        assert torch.equal(align.pair_is_correct, data["alignment_pair_is_correct"])
-        assert torch.equal(align.sample_mask, data["sample_mask"])
-
-
 class TestCollectOverlappingTeacherShards:
     @staticmethod
     def _shard(vstart, vend, gss, seq):

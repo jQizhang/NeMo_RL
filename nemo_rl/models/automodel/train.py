@@ -23,14 +23,21 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import enum
 from collections import defaultdict
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 import torch
+from nemo_automodel.components.distributed.context_parallel import (
+    ContextParallelSharder,
+)
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -38,18 +45,25 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
-    apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.utils import (
+    needs_unfiltered_reference_logprobs,
+    prepare_precomputed_distillation_loss_input,
+    prepare_precomputed_logprob_loss_input,
+)
+from nemo_rl.algorithms.x_token.loss_utils import (
+    prepare_xtoken_window_loss_inputs,
+)
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
-    cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
-    get_logprobs_from_vocab_parallel_logits,
+    get_student_distillation_statistics_from_vocab_parallel_logits,
+    get_target_logprobs_from_vocab_parallel_logits,
+    resolve_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
@@ -64,65 +78,198 @@ PostProcessingFunction = Union[
 ]
 
 
-def model_forward(
+class CPLossContract(enum.Enum):
+    """How an Automodel loss consumes model contributions across CP ranks."""
+
+    REPLICATED = "replicated"
+    PARTITIONED = "partitioned"
+
+
+_CP_LOSS_CONTRACTS = {
+    LossInputType.LOGPROB: CPLossContract.REPLICATED,
+    LossInputType.DISTILLATION: CPLossContract.REPLICATED,
+    LossInputType.DISTILLATION_CROSS_TOKENIZER: CPLossContract.PARTITIONED,
+}
+
+
+@dataclass
+class PreparedModelForward:
+    """Model inputs and Automodel layout resolved for one microbatch."""
+
+    model_batch: dict[str, Any]
+    cp_sharder: ContextParallelSharder
+    model_context_factory: Callable[[], AbstractContextManager[Any]]
+
+
+@dataclass(frozen=True)
+class FullLogitsShard:
+    """One producer's contiguous sequence and vocabulary logits shard."""
+
+    local_logits: torch.Tensor
+    tp_rank: int
+    tp_size: int
+    vocab_start_index: int
+    vocab_end_index: int
+    full_vocab_size: int
+    global_seq_start: int
+    full_seq_len: int
+    vocab_sharded: bool
+    sequence_sharded: bool
+
+
+def get_model_output_vocab_size(model: nn.Module) -> int:
+    """Return the logical vocabulary width emitted by the model head."""
+    output_head = None
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if callable(get_output_embeddings):
+        output_head = get_output_embeddings()
+    if output_head is None:
+        output_head = getattr(model, "lm_head", None)
+
+    head_width: Optional[int] = None
+    if output_head is not None:
+        out_features = getattr(output_head, "out_features", None)
+        if out_features is not None:
+            head_width = int(out_features)
+        weight = getattr(output_head, "weight", None)
+        if weight is not None:
+            weight_width = int(weight.shape[0])
+            if head_width is not None and weight_width != head_width:
+                raise ValueError(
+                    "The output head reports inconsistent vocabulary widths: "
+                    f"out_features={head_width}, weight.shape[0]={weight_width}."
+                )
+            head_width = weight_width
+
+    config_width = getattr(getattr(model, "config", None), "vocab_size", None)
+    if head_width is None and config_width is not None:
+        head_width = int(config_width)
+    if head_width is None or head_width <= 0:
+        raise ValueError(
+            "Could not resolve a positive logical output vocabulary width from "
+            "the model output head or config."
+        )
+    return head_width
+
+
+def _build_model_batch(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
-    is_reward_model: bool = False,
-    allow_flash_attn_args: bool = True,
-) -> torch.Tensor:
-    """Perform a single forward pass through the model.
-
-    Args:
-        model: The model to run forward pass on
-        processed_inputs: ProcessedInputs containing all tensors for forward pass
-        is_reward_model: Whether this is a reward model
-        allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
-
-    Returns:
-        torch.Tensor: Output tensor from the model (logits)
-    """
-    model_args = dict(
-        input_ids=processed_inputs.input_ids,
-        attention_mask=processed_inputs.attention_mask,
-        position_ids=processed_inputs.position_ids,
-        use_cache=False,
-    )
-
-    # Add flash attention kwargs if applicable
+    *,
+    is_reward_model: bool,
+    allow_flash_attn_args: bool,
+) -> dict[str, Any]:
+    """Build a private model-facing batch for one forward."""
+    model_batch: dict[str, Any] = {
+        "input_ids": processed_inputs.input_ids,
+        "use_cache": False,
+    }
+    if processed_inputs.attention_mask is not None:
+        model_batch["attention_mask"] = processed_inputs.attention_mask
+    if processed_inputs.position_ids is not None:
+        model_batch["position_ids"] = processed_inputs.position_ids
     if processed_inputs.has_flash_attention:
-        model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
+        model_batch["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
 
-    # Add VLM kwargs if applicable
     if processed_inputs.is_multimodal:
-        model_args.update(processed_inputs.vlm_kwargs)
-        # flash_attn_kwargs is not supported for multimodal
-        if "flash_attn_kwargs" in model_args:
-            del model_args["flash_attn_kwargs"]
+        reserved = {
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "use_cache",
+            "flash_attn_kwargs",
+            "labels",
+        }
+        collisions = reserved.intersection(processed_inputs.vlm_kwargs)
+        if collisions:
+            raise ValueError(
+                "Multimodal kwargs collide with model-batch-owned keys: "
+                f"{sorted(collisions)}."
+            )
+        model_batch.update(processed_inputs.vlm_kwargs)
+        model_batch.pop("flash_attn_kwargs", None)
 
     is_gemma3 = isinstance(model, Gemma3ForCausalLM) or isinstance(
         model, Gemma3ForConditionalGeneration
     )
-    if is_gemma3 and "token_type_ids" not in model_args:
-        model_args["token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
+    if is_gemma3 and "token_type_ids" not in model_batch:
+        model_batch["token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
 
-    # Gemma 4 requires mm_token_type_ids even for text-only inputs
     if getattr(getattr(model, "config", None), "model_type", None) == "gemma4":
-        if "mm_token_type_ids" not in model_args:
-            model_args["mm_token_type_ids"] = torch.zeros_like(
+        if "mm_token_type_ids" not in model_batch:
+            model_batch["mm_token_type_ids"] = torch.zeros_like(
                 processed_inputs.input_ids
             )
 
-    # Reward models don't support flash_attn_kwargs
-    if is_reward_model:
-        if "flash_attn_kwargs" in model_args:
-            del model_args["flash_attn_kwargs"]
+    if is_reward_model or not allow_flash_attn_args:
+        model_batch.pop("flash_attn_kwargs", None)
 
-    # Remove flash_attn_kwargs if not allowed
-    if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
-        del model_args["flash_attn_kwargs"]
+    for key in (
+        "input_ids",
+        "position_ids",
+        "attention_mask",
+        "token_type_ids",
+        "mm_token_type_ids",
+    ):
+        value = model_batch.get(key)
+        if isinstance(value, torch.Tensor):
+            model_batch[key] = value.clone()
+    return model_batch
 
-    outputs = model(**model_args)
-    return outputs
+
+def prepare_model_forward(
+    model: nn.Module,
+    processed_inputs: ProcessedInputs,
+    *,
+    device_mesh: Optional[DeviceMesh],
+    padding_token_id: int,
+    is_reward_model: bool,
+    allow_flash_attn_args: bool,
+) -> PreparedModelForward:
+    """Build model inputs and resolve Automodel CP for one microbatch."""
+    model_batch = _build_model_batch(
+        model,
+        processed_inputs,
+        is_reward_model=is_reward_model,
+        allow_flash_attn_args=allow_flash_attn_args,
+    )
+    if "labels" in model_batch:
+        raise ValueError("NeMo RL model batches must not provide model-owned labels.")
+    input_ids = model_batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise ValueError("The Automodel NeMo RL path requires tensor input_ids.")
+    model_batch["labels"] = torch.full_like(input_ids, -100)
+
+    cp_sharder = ContextParallelSharder(
+        model,
+        device_mesh,
+        model_batch,
+        padding_token_id=padding_token_id,
+        num_chunks=1,
+    )
+    model_context_factory, model_batch = cp_sharder.shard(model_batch)
+    model_batch.pop("labels")
+    return PreparedModelForward(
+        model_batch=model_batch,
+        cp_sharder=cp_sharder,
+        model_context_factory=model_context_factory,
+    )
+
+
+def model_forward(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+) -> Any:
+    """Run a model on an already prepared model-facing batch.
+
+    Args:
+        model: The model to run forward pass on
+        model_batch: Private batch already processed by the Automodel sharder.
+
+    Returns:
+        The model-specific forward output.
+    """
+    return model(**model_batch)
 
 
 def extract_logits(
@@ -164,123 +311,11 @@ def apply_temperature_scaling(
     return logits
 
 
-def apply_top_k_top_p_filtering_for_local_logits(
-    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
-) -> torch.Tensor:
-    """Apply top-k and top-p filtering to the non-distributed logits.
-
-    Args:
-        logits: Logits tensor to filter
-        sampling_params: Sampling parameters
-
-    Returns:
-        torch.Tensor: Filtered logits
-    """
-    if need_top_k_or_top_p_filtering(sampling_params):
-        logits, _ = apply_top_k_top_p(
-            logits,
-            top_k=sampling_params.top_k,
-            top_p=sampling_params.top_p,
-        )
-    return logits
-
-
-def redistribute_logits_for_cp(
-    logits: torch.Tensor,
-    device_mesh: Any,
-    cp_mesh: Any,  # noqa: ARG001
-    sequence_dim: int = 1,
-) -> DTensor:
-    """Redistribute logits for context parallel processing.
-
-    Handles the case where logits may be TP-sharded DTensor or regular tensor,
-    and converts them to CP+TP sharded DTensor.
-
-    Args:
-        logits: Logits tensor (may be DTensor or regular tensor)
-        device_mesh: Full device mesh
-        cp_mesh: Context parallel mesh (kept for signature compatibility)
-        sequence_dim: Dimension for sequence sharding
-
-    Returns:
-        DTensor sharded on both CP and TP dimensions
-    """
-    if isinstance(logits, DTensor):
-        # Must be tp sharded
-        assert (
-            logits.device_mesh.ndim == 1
-            and logits.device_mesh.mesh_dim_names[0] == "tp"
-        ), "logits must be tp sharded"
-
-        # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
-        logits = DTensor.from_local(
-            logits.to_local(),
-            device_mesh=device_mesh[("cp", "tp")],
-            placements=[Shard(sequence_dim), Shard(-1)],
-        )
-    else:
-        logits = DTensor.from_local(
-            logits,
-            device_mesh=device_mesh[("cp", "tp")],
-            placements=[Shard(sequence_dim), Shard(-1)],
-        )
-    return logits
-
-
-def prepare_data_for_cp(
-    mb: BatchedDataDict[Any],
-    processed_inputs: ProcessedInputs,
-    cp_mesh: Any,
-    sequence_dim: int = 1,
-) -> tuple[torch.Tensor, BatchedDataDict[Any]]:
-    """Prepare data for context parallel processing.
-
-    Converts seq_index to full tensor and wraps CP-sharded tensors in DTensor.
-
-    Args:
-        mb: Microbatch data dictionary
-        processed_inputs: Processed inputs containing CP buffers
-        cp_mesh: Context parallel mesh
-        sequence_dim: Dimension for sequence sharding
-
-    Returns:
-        Tuple of (seq_index_dtensor, updated_mb)
-    """
-    seq_index_dtensor = (
-        DTensor.from_local(
-            processed_inputs.seq_index,
-            device_mesh=cp_mesh,
-            placements=[Shard(1)],
-        )
-        .full_tensor()
-        .squeeze(0)
-    )
-
-    mb["seq_index"] = seq_index_dtensor
-
-    for tensor_name in mb:
-        current_tensor = mb[tensor_name]
-        for buffer in processed_inputs.cp_buffers:
-            if current_tensor is buffer:
-                assert type(current_tensor) == torch.Tensor, (
-                    f"tensor {tensor_name} is not a tensor"
-                )
-                mb[tensor_name] = DTensor.from_local(
-                    current_tensor,
-                    device_mesh=cp_mesh,
-                    placements=[Shard(sequence_dim)],
-                )
-                break
-
-    return seq_index_dtensor, mb
-
-
 def forward_with_post_processing_fn(
     model: nn.Module,
+    prepared: PreparedModelForward,
     post_processing_fn: PostProcessingFunction,
     processed_mb: ProcessedMicrobatch,
-    is_reward_model: bool = False,
-    allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
@@ -297,10 +332,9 @@ def forward_with_post_processing_fn(
 
     Args:
         model: The model to run forward pass on
+        prepared: Per-microbatch model batch, context, and token layout.
         post_processing_fn: Post-processing function to apply to the logits
         processed_mb: Pre-fetched ProcessedMicrobatch containing data and processed inputs
-        is_reward_model: Whether this is a reward model
-        allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
         sampling_params: Sampling parameters (top-k, top-p, temperature)
@@ -317,12 +351,7 @@ def forward_with_post_processing_fn(
     processed_inputs = processed_mb.processed_inputs
 
     # Model forward pass
-    outputs = model_forward(
-        model,
-        processed_inputs,
-        is_reward_model=is_reward_model,
-        allow_flash_attn_args=allow_flash_attn_args,
-    )
+    outputs = model_forward(model, prepared.model_batch)
 
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
@@ -352,6 +381,7 @@ def forward_with_post_processing_fn(
             processed_inputs=processed_inputs,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            cp_sharder=prepared.cp_sharder,
             sequence_dim=sequence_dim,
         )
     elif isinstance(
@@ -364,6 +394,7 @@ def forward_with_post_processing_fn(
             processed_inputs=processed_inputs,
             original_batch_size=processed_mb.original_batch_size,
             original_seq_len=processed_mb.original_seq_len,
+            cp_sharder=prepared.cp_sharder,
             sequence_dim=sequence_dim,
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
@@ -378,9 +409,10 @@ def forward_with_post_processing_fn(
             processed_inputs=processed_inputs,
             original_batch_size=processed_mb.original_batch_size,
             original_seq_len=processed_mb.original_seq_len,
+            cp_sharder=prepared.cp_sharder,
             sequence_dim=sequence_dim,
         )
-        metrics = {"full_logits": result}
+        metrics = {"full_logits": result.local_logits}
     elif isinstance(post_processing_fn, ScorePostProcessor):
         result = post_processing_fn(logits=logits)
         metrics = {"scores": result}
@@ -397,6 +429,9 @@ def automodel_forward_backward(
     model: nn.Module,
     data_iterator: Iterator[ProcessedMicrobatch],
     post_processing_fn: PostProcessingFunction,
+    device_mesh: Optional[DeviceMesh],
+    padding_token_id: int,
+    autocast_context_factory: Callable[[], AbstractContextManager[Any]],
     forward_only: bool = False,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
@@ -407,7 +442,6 @@ def automodel_forward_backward(
     dp_size: int = 1,
     cp_size: int = 1,
     num_global_batches: int = 1,
-    train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
@@ -422,8 +456,10 @@ def automodel_forward_backward(
     Args:
         model: The model to train
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
-        num_microbatches: Number of microbatches to process
         post_processing_fn: Post-processing function to apply to the logits
+        device_mesh: Worker device mesh used by Automodel CP resolution.
+        padding_token_id: Token ID used for Automodel sequence padding.
+        autocast_context_factory: Worker-owned precision context factory.
         forward_only: If True, skip backward pass
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
@@ -434,8 +470,6 @@ def automodel_forward_backward(
         dp_size: Data parallel size
         cp_size: Context parallel size
         num_global_batches: Number of global batches (for metric scaling)
-        train_context_fn: Optional callable that takes ProcessedInputs and returns
-            a context manager for the forward/backward pass. If None, no context is used.
         num_valid_microbatches: Number of valid (non-dummy) microbatches. If provided,
             microbatches beyond this index are treated as dummy batches (loss *= 0).
             If None, all microbatches are considered valid.
@@ -445,8 +479,8 @@ def automodel_forward_backward(
     Returns:
         List of (result, metrics) tuples from each microbatch
     """
-    from contextlib import nullcontext
-
+    if not forward_only and not isinstance(post_processing_fn, LossPostProcessor):
+        raise TypeError("Backward execution requires LossPostProcessor.")
     results = []
 
     for mb_idx, processed_mb in enumerate(data_iterator):
@@ -455,21 +489,22 @@ def automodel_forward_backward(
             on_microbatch_start(mb_idx)
 
         processed_inputs = processed_mb.processed_inputs
+        prepared = prepare_model_forward(
+            model,
+            processed_inputs,
+            device_mesh=device_mesh,
+            padding_token_id=padding_token_id,
+            is_reward_model=is_reward_model,
+            allow_flash_attn_args=allow_flash_attn_args,
+        )
 
-        # Create train context if factory provided, otherwise use nullcontext
-        if train_context_fn is not None:
-            ctx = train_context_fn(processed_inputs)
-        else:
-            ctx = nullcontext()
-
-        with ctx:
+        with prepared.model_context_factory(), autocast_context_factory():
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
+                prepared=prepared,
                 post_processing_fn=post_processing_fn,
                 processed_mb=processed_mb,
-                is_reward_model=is_reward_model,
-                allow_flash_attn_args=allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
@@ -504,7 +539,12 @@ def automodel_forward_backward(
 
                     # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                     # but we want to sum them so we cancel out the average here
-                    loss = result * dp_size * cp_size
+                    loss = (
+                        result
+                        * dp_size
+                        * cp_size
+                        / post_processing_fn.cp_gradient_fanout
+                    )
                     loss.backward()
 
         results.append((result, metrics))
@@ -519,36 +559,88 @@ class LossPostProcessor:
         self,
         loss_fn: LossFunction,
         cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
+        tp_mesh: DeviceMesh,
+        expected_global_vocab_size: Optional[int],
+        padding_token_id: int,
         cp_size: int,
         dp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        dp_group: Optional[torch.distributed.ProcessGroup],
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
-    ):
+    ) -> None:
         """Initialize LossPostProcessor.
 
         Args:
             loss_fn: Loss function to compute loss
             cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
             tp_mesh: Tensor parallel mesh
+            expected_global_vocab_size: Logical model output vocabulary width.
             cp_size: Context parallel size
             dp_size: Data parallel size
+            cp_group: Exact context-parallel group, or None at CP1.
+            dp_group: Exact data-parallel group, or None at DP1.
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
+        self.expected_global_vocab_size = expected_global_vocab_size
+        self.padding_token_id = padding_token_id
         self.cp_size = cp_size
         self.dp_size = dp_size
+        self.cp_group = cp_group
+        self.dp_group = dp_group
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+
+        if cp_size > 1:
+            if (
+                cp_group is None
+                or torch.distributed.get_world_size(cp_group) != cp_size
+            ):
+                raise ValueError(
+                    "cp_group must match cp_size for CP-enabled loss processing."
+                )
+        elif cp_group is not None:
+            raise ValueError("cp_group must be None when cp_size == 1.")
+        if dp_size > 1:
+            if (
+                dp_group is None
+                or torch.distributed.get_world_size(dp_group) != dp_size
+            ):
+                raise ValueError(
+                    "dp_group must match dp_size for distributed loss processing."
+                )
+        elif dp_group is not None:
+            raise ValueError("dp_group must be None when dp_size == 1.")
+
+        self._cp_contract = _CP_LOSS_CONTRACTS.get(loss_fn.input_type)
+        if cp_size > 1 and self._cp_contract is None:
+            raise ValueError(
+                f"CP>1 does not support loss input type {loss_fn.input_type}."
+            )
+        self._cp_gradient_fanout = (
+            cp_size
+            if cp_size > 1 and self._cp_contract is CPLossContract.REPLICATED
+            else 1
+        )
+
+    def _require_output_vocab_size(self) -> int:
+        """Return the configured model vocabulary for vocabulary-based losses."""
+        if self.expected_global_vocab_size is None:
+            raise ValueError(
+                f"Loss input type {self.loss_fn.input_type} requires a logical "
+                "model output vocabulary size."
+            )
+        return self.expected_global_vocab_size
+
+    @property
+    def cp_gradient_fanout(self) -> int:
+        """Number of CP loss consumers for each local model contribution."""
+        return self._cp_gradient_fanout
 
     def __call__(
         self,
@@ -557,6 +649,8 @@ class LossPostProcessor:
         processed_inputs: ProcessedInputs,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        *,
+        cp_sharder: ContextParallelSharder,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss from logits.
@@ -567,26 +661,19 @@ class LossPostProcessor:
             processed_inputs: Processed inputs
             global_valid_seqs: Global valid sequence count
             global_valid_toks: Global valid token count
+            cp_sharder: Per-microbatch Automodel token-layout owner.
             sequence_dim: Sequence dimension
 
         Returns:
             Tuple of (loss, metrics)
         """
-        # Handle CP redistribution
-        if self.cp_size > 1:
-            _, data_dict = prepare_data_for_cp(
-                data_dict, processed_inputs, self.cp_mesh, sequence_dim
-            )
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
-            )
-
-        # Wrap prepare_loss_input with sampling_params
+        del sequence_dim
         prepare_loss_input_wrapped = partial(
             prepare_loss_input, sampling_params=self.sampling_params
         )
-        # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
+            if self.cp_size != 1:
+                raise ValueError("Sequence packing is not supported with CP>1.")
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
@@ -599,17 +686,131 @@ class LossPostProcessor:
                 global_valid_seqs,
                 global_valid_toks,
             )
+            return loss, loss_metrics
+
+        if self.loss_fn.input_type == LossInputType.LOGPROB:
+            vocab = resolve_vocab_parallel_logits(
+                logits,
+                tp_mesh=self.tp_mesh,
+                expected_global_vocab_size=self._require_output_vocab_size(),
+            )
+            input_ids = data_dict["input_ids"].to(vocab.local_logits.device)
+            targets = input_ids.roll(shifts=-1, dims=1)
+            local_targets = cp_sharder.shard_token_tensor(
+                targets, seq_dim=1, fill=self.padding_token_id
+            )
+            local_logprobs = get_target_logprobs_from_vocab_parallel_logits(
+                vocab.local_logits,
+                local_targets,
+                tp_group=vocab.vocab_parallel_group,
+                vocab_start_index=vocab.vocab_start_index,
+                vocab_end_index=vocab.vocab_end_index,
+                global_vocab_size=vocab.global_vocab_size,
+                chunk_size=self.logprob_chunk_size,
+                sampling_params=self.sampling_params,
+                inference_only=False,
+            )
+            logprobs = cp_sharder.gather_token_tensor(
+                local_logprobs, seq_dim=1, trim=True, fill=0.0
+            )[:, :-1]
+
+            unfiltered_logprobs = None
+            if needs_unfiltered_reference_logprobs(self.loss_fn, self.sampling_params):
+                local_unfiltered = get_target_logprobs_from_vocab_parallel_logits(
+                    vocab.local_logits,
+                    local_targets,
+                    tp_group=vocab.vocab_parallel_group,
+                    vocab_start_index=vocab.vocab_start_index,
+                    vocab_end_index=vocab.vocab_end_index,
+                    global_vocab_size=vocab.global_vocab_size,
+                    chunk_size=self.logprob_chunk_size,
+                    sampling_params=None,
+                    inference_only=False,
+                )
+                unfiltered_logprobs = cp_sharder.gather_token_tensor(
+                    local_unfiltered, seq_dim=1, trim=True, fill=0.0
+                )[:, :-1]
+
+            loss_input, data_dict = prepare_precomputed_logprob_loss_input(
+                logprobs,
+                data_dict,
+                self.loss_fn,
+                sampling_params=self.sampling_params,
+                unfiltered_logprobs=unfiltered_logprobs,
+            )
+        elif self.loss_fn.input_type == LossInputType.DISTILLATION:
+            vocab = resolve_vocab_parallel_logits(
+                logits,
+                tp_mesh=self.tp_mesh,
+                expected_global_vocab_size=self._require_output_vocab_size(),
+            )
+            teacher_indices = data_dict["teacher_topk_indices"].to(
+                vocab.local_logits.device
+            )
+            local_teacher_indices = cp_sharder.shard_token_tensor(
+                teacher_indices, seq_dim=1, fill=0
+            )
+            calculate_entropy = (
+                self.loss_fn.zero_outside_topk and self.loss_fn.kl_type != "forward"
+            )
+            local_student_logprobs, local_entropy = (
+                get_student_distillation_statistics_from_vocab_parallel_logits(
+                    vocab.local_logits,
+                    local_teacher_indices,
+                    tp_group=vocab.vocab_parallel_group,
+                    vocab_start_index=vocab.vocab_start_index,
+                    vocab_end_index=vocab.vocab_end_index,
+                    global_vocab_size=vocab.global_vocab_size,
+                    zero_outside_topk=self.loss_fn.zero_outside_topk,
+                    calculate_entropy=calculate_entropy,
+                    chunk_size=self.logprob_chunk_size,
+                )
+            )
+            student_logprobs = cp_sharder.gather_token_tensor(
+                local_student_logprobs, seq_dim=1, trim=True, fill=0.0
+            )
+            entropy = None
+            if local_entropy is not None:
+                entropy = cp_sharder.gather_token_tensor(
+                    local_entropy, seq_dim=1, trim=True, fill=0.0
+                )
+            loss_input = prepare_precomputed_distillation_loss_input(
+                student_logprobs,
+                data_dict["teacher_topk_logits"],
+                entropy,
+            )
+        elif self.loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
+            vocab = resolve_vocab_parallel_logits(
+                logits,
+                tp_mesh=self.tp_mesh,
+                expected_global_vocab_size=self._require_output_vocab_size(),
+            )
+            full_student_logits = cp_sharder.gather_token_tensor(
+                vocab.local_logits, seq_dim=1, trim=True, fill=0.0
+            )
+            loss_input = prepare_xtoken_window_loss_inputs(
+                full_student_logits,
+                data_dict,
+                vocab=vocab,
+                student_tokenizer_vocab_size=self.loss_fn.student_tokenizer_vocab_size,
+                teacher_tokenizer_vocab_sizes=self.loss_fn.teacher_vocab_sizes,
+                projection_matrix_paths=self.loss_fn.projection_matrix_paths,
+                context_parallel_group=self.cp_group,
+                data_parallel_group=self.dp_group,
+                logprob_chunk_size=self.logprob_chunk_size,
+            )
+            del full_student_logits
         else:
             loss_input, data_dict = prepare_loss_input_wrapped(
                 logits, data_dict, self.loss_fn
             )
-            loss, loss_metrics = self.loss_fn(
-                data=data_dict,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
 
+        loss, loss_metrics = self.loss_fn(
+            data=data_dict,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
         return loss, loss_metrics
 
 
@@ -619,28 +820,18 @@ class LogprobsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
+        tp_mesh: DeviceMesh,
+        expected_global_vocab_size: int,
+        padding_token_id: int,
         cp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
-    ):
-        """Initialize LogprobsPostProcessor.
-
-        Args:
-            cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
-            tp_mesh: Tensor parallel mesh
-            cp_size: Context parallel size
-            enable_seq_packing: Whether sequence packing is enabled
-            sampling_params: Sampling parameters
-        """
+    ) -> None:
+        """Initialize the logprob postprocessor."""
         self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
+        self.expected_global_vocab_size = expected_global_vocab_size
+        self.padding_token_id = padding_token_id
         self.cp_size = cp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
@@ -653,6 +844,8 @@ class LogprobsPostProcessor:
         processed_inputs: ProcessedInputs,
         original_batch_size: int,
         original_seq_len: int,
+        *,
+        cp_sharder: ContextParallelSharder,
         sequence_dim: int = 1,
     ) -> torch.Tensor:
         """Compute token log probabilities from logits.
@@ -668,53 +861,37 @@ class LogprobsPostProcessor:
         Returns:
             Token log probabilities tensor [batch_size, seq_length]
         """
+        del sequence_dim
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
-
-        if self.cp_size > 1:
-            seq_index_tensor = (
-                DTensor.from_local(
-                    processed_inputs.seq_index,
-                    device_mesh=self.cp_mesh,
-                    placements=[Shard(1)],
-                )
-                .full_tensor()
-                .squeeze(0)
-            )
-
-            input_ids_dtensor = DTensor.from_local(
-                processed_inputs.input_ids,
-                device_mesh=self.cp_mesh,
-                placements=[Shard(sequence_dim)],
-            )
-
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
-            )
-
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                logits,
-                input_ids_dtensor,
-                seq_index_tensor,
-                chunk_size=self.logprob_chunk_size,
-                sampling_params=self.sampling_params,  # top-k and top-p filtering
-            )
-
-            assert token_logprobs.shape[1] == seq_len - 1
-        else:
-            if isinstance(logits, DTensor):
-                # DTensor path with TP sharding
-                token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                    logits,
-                    processed_inputs.input_ids,
-                    chunk_size=self.logprob_chunk_size,
-                    sampling_params=self.sampling_params,  # top-k and top-p filtering
-                )
-            else:
-                # Non-DTensor path (no TP sharding)
-                token_logprobs = self._compute_local_logprobs(
-                    logits, processed_inputs.input_ids
-                )
+        vocab = resolve_vocab_parallel_logits(
+            logits,
+            tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self.expected_global_vocab_size,
+        )
+        source_input_ids = (
+            processed_inputs.input_ids
+            if self.enable_seq_packing
+            else data_dict["input_ids"]
+        ).to(vocab.local_logits.device)
+        targets = source_input_ids.roll(shifts=-1, dims=1)
+        local_targets = cp_sharder.shard_token_tensor(
+            targets, seq_dim=1, fill=self.padding_token_id
+        )
+        local_logprobs = get_target_logprobs_from_vocab_parallel_logits(
+            vocab.local_logits,
+            local_targets,
+            tp_group=vocab.vocab_parallel_group,
+            vocab_start_index=vocab.vocab_start_index,
+            vocab_end_index=vocab.vocab_end_index,
+            global_vocab_size=vocab.global_vocab_size,
+            chunk_size=self.logprob_chunk_size,
+            sampling_params=self.sampling_params,
+            inference_only=True,
+        )
+        token_logprobs = cp_sharder.gather_token_tensor(
+            local_logprobs, seq_dim=1, trim=True, fill=0.0
+        )[:, :-1]
 
         # Prepend 0 for first token to maintain sequence length
         token_logprobs = torch.cat(
@@ -757,72 +934,6 @@ class LogprobsPostProcessor:
 
         return token_logprobs
 
-    def _compute_local_logprobs(
-        self,
-        logits: torch.Tensor,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute logprobs locally without distributed processing.
-
-        Args:
-            logits: Model output logits
-            input_ids: Input token IDs
-
-        Returns:
-            Token log probabilities
-
-        When ``logprob_chunk_size`` is set, log-softmax and gather run per
-        sequence chunk to bound peak memory for long-context runs.
-        """
-        # Extract logprobs for each token in the sequence by gathering the logprob
-        # corresponding to the next token at each position
-        # Input shapes:
-        #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
-        #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = input_ids[:, 1:].to(logits.device)
-        target_seq_len = int(next_tokens.shape[1])
-
-        if target_seq_len == 0:
-            return logits.new_empty(
-                (input_ids.shape[0], 0),
-                dtype=torch.float32,
-            )
-
-        logits = logits[:, :target_seq_len, :]
-
-        if self.logprob_chunk_size is None:
-            logits = logits.to(torch.float32).contiguous()
-            logits = apply_top_k_top_p_filtering_for_local_logits(
-                logits, self.sampling_params
-            )
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            token_logprobs = log_probs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
-            del log_probs
-            return token_logprobs
-
-        chunked_token_logprobs = []
-        for chunk_start in range(0, target_seq_len, self.logprob_chunk_size):
-            chunk_end = min(chunk_start + self.logprob_chunk_size, target_seq_len)
-            chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
-            chunk_logits = chunk_logits.contiguous()
-            chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
-                chunk_logits, self.sampling_params
-            )
-            chunk_log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
-            chunk_token_logprobs = chunk_log_probs.gather(
-                dim=-1,
-                index=next_tokens[:, chunk_start:chunk_end].unsqueeze(-1),
-            ).squeeze(-1)
-            chunked_token_logprobs.append(chunk_token_logprobs)
-            del chunk_log_probs, chunk_logits
-
-        token_logprobs = torch.cat(chunked_token_logprobs, dim=1)
-        del chunked_token_logprobs
-
-        return token_logprobs
-
 
 class TopkLogitsPostProcessor:
     """Post-processor for computing top-k logits from model outputs."""
@@ -830,28 +941,25 @@ class TopkLogitsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
+        tp_mesh: DeviceMesh,
+        expected_global_vocab_size: int,
         cp_size: int,
         k: int,
         enable_seq_packing: bool = False,
-    ):
+    ) -> None:
         """Initialize TopkLogitsPostProcessor.
 
         Args:
             cfg: Configuration dictionary
-            device_mesh: Full device mesh
-            cp_mesh: Context parallel mesh
             tp_mesh: Tensor parallel mesh
+            expected_global_vocab_size: Logical model output vocabulary width.
             cp_size: Context parallel size
             k: Number of top logits to return
             enable_seq_packing: Whether sequence packing is enabled
         """
         self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
+        self.expected_global_vocab_size = expected_global_vocab_size
         self.cp_size = cp_size
         self.k = k
         self.enable_seq_packing = enable_seq_packing
@@ -863,6 +971,8 @@ class TopkLogitsPostProcessor:
         processed_inputs: ProcessedInputs,
         original_batch_size: int,
         original_seq_len: int,
+        *,
+        cp_sharder: ContextParallelSharder,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute top-k logits and indices from model outputs.
@@ -878,56 +988,32 @@ class TopkLogitsPostProcessor:
         Returns:
             Tuple of (top-k values, top-k indices) tensors
         """
+        del sequence_dim
         input_lengths = data_dict["input_lengths"]
-
-        if self.cp_size > 1:
-            logits = redistribute_logits_for_cp(
-                logits, self.device_mesh, self.cp_mesh, sequence_dim
+        vocab = resolve_vocab_parallel_logits(
+            logits,
+            tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self.expected_global_vocab_size,
+        )
+        if not 1 <= self.k <= vocab.global_vocab_size:
+            raise ValueError(
+                f"k must be in [1, {vocab.global_vocab_size}], got {self.k}."
             )
-
-            # Deal with TP first
-            local_logits = logits.to_local()  # [B, S_cp, V_tp]
-
-            tp_group = self.tp_mesh.get_group()
-            tp_rank = torch.distributed.get_rank(tp_group)
-            V_local = int(local_logits.shape[-1])
-            vocab_start_index = tp_rank * V_local
-            vocab_end_index = (tp_rank + 1) * V_local
-
+        if vocab.vocab_parallel_group is not None:
             vals, idx = distributed_vocab_topk(
-                local_logits,
+                vocab.local_logits,
                 k=self.k,
-                tp_group=tp_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
+                tp_group=vocab.vocab_parallel_group,
+                vocab_start_index=vocab.vocab_start_index,
+                vocab_end_index=vocab.vocab_end_index,
+                global_vocab_size=vocab.global_vocab_size,
             )
-            # [B, S_cp, k]
-
-            cp_group = self.cp_mesh.get_group()
-
-            vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
-            idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
-            # [B, S, k]
         else:
-            # Compute top-k over full sequence length
-            if isinstance(logits, DTensor):
-                local_logits = logits.to_local()  # [B, S, V_local]
-                tp_group = self.tp_mesh.get_group()
-                tp_rank = torch.distributed.get_rank(tp_group)
-                V_local = int(local_logits.shape[-1])
-                vocab_start_index = tp_rank * V_local
-                vocab_end_index = (tp_rank + 1) * V_local
-
-                vals, idx = distributed_vocab_topk(
-                    local_logits,
-                    k=self.k,
-                    tp_group=tp_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
-            else:
-                full_logits = logits.to(torch.float32)
-                vals, idx = torch.topk(full_logits, k=self.k, dim=-1)
+            vals, idx = torch.topk(
+                vocab.local_logits.to(torch.float32), k=self.k, dim=-1
+            )
+        vals = cp_sharder.gather_token_tensor(vals, seq_dim=1, trim=True, fill=0.0)
+        idx = cp_sharder.gather_token_tensor(idx, seq_dim=1, trim=True, fill=0)
 
         # Handle sequence packing unpacking
         if self.enable_seq_packing:
@@ -964,32 +1050,33 @@ class TopkLogitsPostProcessor:
 
 
 class FullLogitsPostProcessor:
-    """Export this rank's raw teacher logits (full vocab, no reduction at the worker).
+    """Export one teacher's contiguous CP window and local vocabulary shard.
 
-    Used by cross-tokenizer distillation; the loss fn does all vocab
-    reduction (none at the worker) so the distributed result matches the
-    single-GPU PyTorch reference. Teacher TP/CP
-    are supported and may differ from the student's: under TP each rank emits
-    its vocab shard, under CP it allgathers and re-emits its contiguous seq
-    slice; the IPC consumer reassembles the global ``[B, T_t, V_t]``.
-    Sequence packing raises ``NotImplementedError``.
+    Automodel first restores model-layout logits to canonical token order. This
+    postprocessor retains only the producer's contiguous CP window; the IPC
+    consumer reassembles the requested full-vocabulary window from all producer
+    rectangles. Teacher and student TP/CP topologies may differ. Sequence
+    packing is unsupported.
     """
 
     def __init__(
         self,
-        cfg: PolicyConfig,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
-        cp_size: int,
+        tp_mesh: DeviceMesh,
+        expected_global_vocab_size: int,
+        producer_cp_rank: int,
+        producer_cp_size: int,
         enable_seq_packing: bool = False,
-    ):
-        self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
+    ) -> None:
         self.tp_mesh = tp_mesh
-        self.cp_size = cp_size
+        self.expected_global_vocab_size = expected_global_vocab_size
+        self.producer_cp_rank = producer_cp_rank
+        self.producer_cp_size = producer_cp_size
         self.enable_seq_packing = enable_seq_packing
+        if producer_cp_size <= 0 or not 0 <= producer_cp_rank < producer_cp_size:
+            raise ValueError(
+                "Invalid producer CP topology: "
+                f"rank={producer_cp_rank}, size={producer_cp_size}."
+            )
 
     def __call__(
         self,
@@ -998,28 +1085,60 @@ class FullLogitsPostProcessor:
         processed_inputs: Any,
         original_batch_size: int,
         original_seq_len: int,
+        *,
+        cp_sharder: ContextParallelSharder,
         sequence_dim: int = 1,
-    ) -> torch.Tensor:
+    ) -> FullLogitsShard:
+        del data_dict, processed_inputs, sequence_dim
         if self.enable_seq_packing:
             raise NotImplementedError(
                 "FullLogitsPostProcessor: sequence packing is not supported in v0."
             )
-        if isinstance(logits, DTensor):
-            logits = logits.to_local()
-        # fp32 for the consumer's precision-sensitive log_softmax / top-k /
-        # projection (KL math), and a dtype-consistent IPC buffer producer<->consumer.
-        logits = logits.to(torch.float32)
-
-        # context_parallel shards the seq dim load-balanced (interleaved), but the
-        # IPC consumer routes by contiguous ``global_seq_start`` over the teacher CP
-        # group. Restore global order and emit this rank's contiguous slice, else
-        # heterogeneous teacher_cp != student_cp lands teacher data at the wrong
-        # seq positions in the consumer's dest tensor.
-        if self.cp_size > 1 and self.cp_mesh is not None:
-            logits = cp_load_balanced_to_contiguous(
-                logits, cp_group=self.cp_mesh.get_group(), seq_dim=sequence_dim
+        vocab = resolve_vocab_parallel_logits(
+            logits,
+            tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self.expected_global_vocab_size,
+        )
+        local_logits = vocab.local_logits.to(torch.float32)
+        full_logits = cp_sharder.gather_token_tensor(
+            local_logits, seq_dim=1, trim=True, fill=0.0
+        )
+        if full_logits.shape[0] != original_batch_size:
+            raise ValueError(
+                "Restored full logits have the wrong batch size: "
+                f"expected {original_batch_size}, got {full_logits.shape[0]}."
             )
-        return logits  # [B, S_local_contiguous, V_t]
+        full_sequence_length = int(full_logits.shape[1])
+        if full_sequence_length != original_seq_len:
+            raise ValueError(
+                "Restored full logits do not match the canonical microbatch length: "
+                f"expected {original_seq_len}, got {full_sequence_length}."
+            )
+        if full_sequence_length % self.producer_cp_size != 0:
+            raise ValueError(
+                "Full-logits IPC requires equal producer CP windows, got "
+                f"sequence length {full_sequence_length} and CP size "
+                f"{self.producer_cp_size}."
+            )
+        local_sequence_length = full_sequence_length // self.producer_cp_size
+        global_seq_start = self.producer_cp_rank * local_sequence_length
+        global_seq_end = global_seq_start + local_sequence_length
+        contiguous_logits = full_logits[
+            :, global_seq_start:global_seq_end, :
+        ].contiguous()
+        del full_logits
+        return FullLogitsShard(
+            local_logits=contiguous_logits,
+            tp_rank=vocab.tp_rank,
+            tp_size=vocab.tp_size,
+            vocab_start_index=vocab.vocab_start_index,
+            vocab_end_index=vocab.vocab_end_index,
+            full_vocab_size=vocab.global_vocab_size,
+            global_seq_start=global_seq_start,
+            full_seq_len=full_sequence_length,
+            vocab_sharded=vocab.is_vocab_sharded,
+            sequence_sharded=self.producer_cp_size > 1,
+        )
 
 
 class ScorePostProcessor:

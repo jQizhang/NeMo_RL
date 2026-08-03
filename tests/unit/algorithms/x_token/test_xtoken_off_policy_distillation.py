@@ -369,7 +369,7 @@ def test_setup_injects_vocab_sizes_into_loss_config():
 
     mocks["loss"].assert_called_once()
     injected_cfg = mocks["loss"].call_args.args[0]
-    assert injected_cfg["student_vocab_size"] == 128
+    assert injected_cfg["student_tokenizer_vocab_size"] == 128
     # Per-teacher metadata is injected as parallel lists (one teacher here).
     assert injected_cfg["teacher_vocab_sizes"] == [256]
     assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]

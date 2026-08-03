@@ -112,6 +112,24 @@ def xtoken_non_student_seq_keys(
     return frozenset(keys)
 
 
+def _is_xtoken_ratio_or_control_metric(name: str) -> bool:
+    """Return whether a worker metric must be averaged rather than summed."""
+    base, separator, suffix = name.rpartition("_t")
+    if separator and suffix.isdigit():
+        name = base
+    return name in {
+        "lr",
+        "wd",
+        "global_valid_seqs",
+        "global_valid_toks",
+        "accuracy",
+        "proj_accuracy",
+        "kl_loss_scale",
+        "weight",
+        "selected_teacher",
+    }
+
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -469,7 +487,7 @@ def setup(
     # the loss derives the top-k subset student-side.
     loss_config = {
         **loss_config,
-        "student_vocab_size": len(student_tokenizer),
+        "student_tokenizer_vocab_size": len(student_tokenizer),
         "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
         "projection_matrix_paths": [t.projection_matrix_path for t in teachers],
         "teacher_weights": [t.weight for t in teachers],
@@ -705,17 +723,7 @@ def xtoken_off_policy_distillation_train(
                 # the gold-loss path emits kl_common/l1_uncommon. Either set
                 # may be present — reduce both via the same rules.
                 for k, v in metrics.items():
-                    if k in {
-                        "lr",
-                        "wd",
-                        "global_valid_seqs",
-                        "global_valid_toks",
-                        "accuracy",
-                        "proj_accuracy",
-                        "kl_loss_scale",
-                        "kl_common",
-                        "l1_uncommon",
-                    }:
+                    if _is_xtoken_ratio_or_control_metric(k):
                         metrics[k] = float(np.mean(v))
                     else:
                         metrics[k] = float(np.sum(v))

@@ -12,27 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Optional
 
 import ray
 import torch
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    create_context_parallel_ctx,
-)
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    get_train_context as get_train_context_automodel,
-)
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from transformers import (
     AutoTokenizer,
 )
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
@@ -51,6 +44,7 @@ from nemo_rl.models.automodel.train import (
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
+    prepare_model_forward,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -93,35 +87,6 @@ class RightShiftLossWrapper:
         return getattr(self._inner, name)
 
 
-@contextlib.contextmanager
-def get_train_context(
-    cp_size: int,
-    cp_mesh: Any,
-    cp_buffers: list,
-    sequence_dim: int,
-    dtype: torch.dtype,
-    autocast_enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Create combined context manager for training with context parallel and autocast."""
-    with contextlib.ExitStack() as stack:
-        context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=cp_mesh,
-                cp_buffers=cp_buffers,
-                cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                cp_no_restore_buffers=set(cp_buffers),
-            )
-
-        stack.enter_context(
-            get_train_context_automodel(False, False, context_parallel_ctx)()
-        )
-        if autocast_enabled:
-            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
-        yield
-
-
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
@@ -159,6 +124,14 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         # Store configuration and tokenizer
         self.cfg = config
         self.tokenizer = tokenizer
+        padding_token_id = tokenizer.pad_token_id
+        if padding_token_id is None:
+            padding_token_id = tokenizer.eos_token_id
+        if padding_token_id is None:
+            raise ValueError(
+                "The Automodel CP sharder requires a tokenizer pad or EOS token ID."
+            )
+        self.padding_token_id = int(padding_token_id)
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
@@ -203,6 +176,8 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.dp_size = distributed_manager.dp_size
         self.tp_size = distributed_manager.tp_size
         self.cp_size = distributed_manager.cp_size
+        self.cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
+        self.dp_group = self.dp_mesh.get_group() if self.dp_size > 1 else None
 
         # Initialize checkpoint manager
         self._init_checkpoint_manager(
@@ -261,6 +236,12 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             _runtime_is_reward_model,
         ) = runtime_config
 
+    def _autocast_context(self) -> AbstractContextManager[Any]:
+        """Return the worker-owned precision context for one model forward."""
+        if not self.autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.dtype)
+
     @wrap_with_nvtx_name("dtensor_value_worker_v2/train")
     def train(
         self,
@@ -271,6 +252,16 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the value function on a batch of data with a given loss function."""
+        if self.cp_size > 1:
+            raise ValueError(
+                "The Automodel value worker does not support CP>1; value logits "
+                "are model-level outputs and have no validated token gather path."
+            )
+        if loss_fn.input_type != LossInputType.LOGIT:
+            raise ValueError(
+                "The Automodel value worker requires a LOGIT loss input, got "
+                f"{loss_fn.input_type}."
+            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -302,24 +293,15 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         loss_post_processor = LossPostProcessor(
             loss_fn=wrapped_loss_fn,
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=None,
+            padding_token_id=self.padding_token_id,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
+            cp_group=self.cp_group,
+            dp_group=self.dp_group,
             enable_seq_packing=self.enable_seq_packing,
         )
-
-        # Create train context factory
-        def train_context_fn(processed_inputs):
-            return get_train_context(
-                cp_size=self.cp_size,
-                cp_mesh=self.cp_mesh,
-                cp_buffers=processed_inputs.cp_buffers,
-                sequence_dim=sequence_dim,
-                dtype=self.dtype,
-                autocast_enabled=self.autocast_enabled,
-            )
 
         # Setup cache clearing callback if configured
         empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -361,7 +343,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
-                    cp_size=self.cp_size,
                 )
 
                 # Use automodel_forward_backward for the training loop.
@@ -369,6 +350,9 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     model=self.model,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
                     is_reward_model=True,  # Value models use reward model architecture
                     allow_flash_attn_args=False,  # Typically False for value models
@@ -378,7 +362,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
                     num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -447,6 +430,11 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ValueOutputSpec]:
         """Get value predictions for a batch of data."""
+        if self.cp_size > 1:
+            raise ValueError(
+                "The Automodel value worker does not support CP>1; value logits "
+                "are model-level outputs and have no validated token gather path."
+            )
         value_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -473,27 +461,26 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                 value_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
 
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    is_reward_model=True,
+                    allow_flash_attn_args=False,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass.
                     values, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=value_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=True,  # Value models use reward model architecture
-                        allow_flash_attn_args=False,
                         sequence_dim=sequence_dim,
                     )
                     # Mirror train()'s right-shift so GAE / value clipping /

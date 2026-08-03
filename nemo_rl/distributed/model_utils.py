@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed.nn.functional
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -28,6 +31,223 @@ if TYPE_CHECKING:
     # megatron-core (optional "mcore" extra) is imported lazily below so this
     # module imports without mcore installed.
     from megatron.core.models.gpt import GPTModel
+
+
+@dataclass(frozen=True)
+class ResolvedVocabParallelLogits:
+    """Local logits and their logical vocabulary ownership."""
+
+    local_logits: torch.Tensor
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+    vocab_start_index: int
+    vocab_end_index: int
+    global_vocab_size: int
+    is_vocab_sharded: bool
+    tp_rank: int
+    tp_size: int
+
+
+def validate_token_ids_in_vocab(
+    token_ids: torch.Tensor,
+    *,
+    global_vocab_size: int,
+    name: str,
+) -> None:
+    """Validate canonical token IDs once before microbatch GPU processing."""
+    if token_ids.dtype != torch.long:
+        raise TypeError(f"{name} must have dtype torch.long, got {token_ids.dtype}.")
+    if token_ids.numel() == 0:
+        return
+    min_id = int(token_ids.min().item())
+    max_id = int(token_ids.max().item())
+    if min_id < 0 or max_id >= global_vocab_size:
+        raise ValueError(
+            f"{name} must lie within [0, {global_vocab_size}), got "
+            f"min={min_id}, max={max_id}."
+        )
+
+
+def _process_group_ranks(
+    group: torch.distributed.ProcessGroup,
+) -> tuple[int, ...]:
+    """Return process-group members in rank order."""
+    return tuple(torch.distributed.get_process_group_ranks(group))
+
+
+def _gather_vocab_widths(
+    local_width: int,
+    group: torch.distributed.ProcessGroup,
+    *,
+    device: torch.device,
+) -> tuple[int, ...]:
+    """Collect local vocabulary widths over a TP group."""
+    width = torch.tensor([local_width], device=device, dtype=torch.int64)
+    gathered = [torch.empty_like(width) for _ in range(group.size())]
+    torch.distributed.all_gather(gathered, width, group=group)
+    return tuple(int(item.item()) for item in gathered)
+
+
+def resolve_vocab_parallel_logits(
+    logits: torch.Tensor | DTensor,
+    *,
+    tp_mesh: DeviceMesh,
+    expected_global_vocab_size: int,
+) -> ResolvedVocabParallelLogits:
+    """Normalize TP-sharded and full-vocabulary model outputs.
+
+    Args:
+        logits: Model logits as a plain tensor or DTensor.
+        tp_mesh: The exact tensor-parallel mesh owned by the worker.
+        expected_global_vocab_size: Logical output width of the model head.
+
+    Returns:
+        A descriptor containing the differentiable local tensor and its global
+        vocabulary interval.
+
+    Raises:
+        ValueError: If the tensor placement, mesh, or vocabulary width is
+            ambiguous or inconsistent with the worker topology.
+        TypeError: If ``logits`` is not a tensor-like model output.
+    """
+    if expected_global_vocab_size <= 0:
+        raise ValueError(
+            "expected_global_vocab_size must be positive, got "
+            f"{expected_global_vocab_size}."
+        )
+
+    physical_tp_group = tp_mesh.get_group()
+    tp_size = int(tp_mesh.size())
+    tp_rank = int(tp_mesh.get_local_rank())
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"Invalid TP topology: {tp_rank=}, {tp_size=}.")
+
+    if not isinstance(logits, (torch.Tensor, DTensor)):
+        raise TypeError(f"logits must be a Tensor or DTensor, got {type(logits)!r}.")
+    if logits.ndim < 1:
+        raise ValueError(
+            f"logits must have a vocabulary dimension, got {logits.shape}."
+        )
+
+    if not isinstance(logits, DTensor):
+        local_width = int(logits.shape[-1])
+        if local_width != expected_global_vocab_size:
+            detail = (
+                "A plain tensor at TP>1 is accepted only as a proven "
+                "full-vocabulary replicated output. "
+                if tp_size > 1
+                else ""
+            )
+            raise ValueError(
+                f"{detail}Expected vocabulary width {expected_global_vocab_size}, "
+                f"got {local_width}."
+            )
+        return ResolvedVocabParallelLogits(
+            local_logits=logits,
+            vocab_parallel_group=None,
+            vocab_start_index=0,
+            vocab_end_index=local_width,
+            global_vocab_size=expected_global_vocab_size,
+            is_vocab_sharded=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
+
+    mesh_names = logits.device_mesh.mesh_dim_names
+    if mesh_names is None or "tp" not in mesh_names:
+        raise ValueError(
+            "Vocabulary DTensor logits must have a named 'tp' mesh dimension; "
+            f"got mesh_dim_names={mesh_names}."
+        )
+    tp_dim = mesh_names.index("tp")
+    logits_tp_group = logits.device_mesh["tp"].get_group()
+    if _process_group_ranks(logits_tp_group) != _process_group_ranks(physical_tp_group):
+        raise ValueError(
+            "The logits TP mesh does not contain the same ranks as the worker TP mesh: "
+            f"logits={_process_group_ranks(logits_tp_group)}, "
+            f"worker={_process_group_ranks(physical_tp_group)}."
+        )
+
+    for dim, placement in enumerate(logits.placements):
+        if dim != tp_dim and not isinstance(placement, Replicate):
+            raise ValueError(
+                "Only the TP vocabulary dimension may be sharded in model logits; "
+                f"mesh dimension {mesh_names[dim]!r} has placement {placement}."
+            )
+
+    tp_placement = logits.placements[tp_dim]
+    if isinstance(tp_placement, Shard):
+        shard_dim = tp_placement.dim
+        if shard_dim < 0:
+            shard_dim += logits.ndim
+        if shard_dim != logits.ndim - 1:
+            raise ValueError(
+                "Vocabulary logits may only be sharded on the final dimension; "
+                f"got placement {tp_placement} for shape {logits.shape}."
+            )
+        is_vocab_sharded = tp_size > 1
+    elif isinstance(tp_placement, Replicate):
+        is_vocab_sharded = False
+    else:
+        raise ValueError(
+            "The TP placement for vocabulary logits must be Shard(-1) or "
+            f"Replicate(), got {tp_placement}."
+        )
+
+    logical_width = int(logits.shape[-1])
+    if logical_width != expected_global_vocab_size:
+        raise ValueError(
+            "The logical DTensor vocabulary width does not match the model head: "
+            f"expected {expected_global_vocab_size}, got {logical_width}."
+        )
+
+    local_logits = logits.to_local()
+    local_width = int(local_logits.shape[-1])
+    if local_width <= 0:
+        raise ValueError(f"Local vocabulary width must be positive, got {local_width}.")
+
+    if not is_vocab_sharded:
+        if local_width != expected_global_vocab_size:
+            raise ValueError(
+                "Replicated vocabulary logits must materialize the full output width: "
+                f"expected {expected_global_vocab_size}, got {local_width}."
+            )
+        return ResolvedVocabParallelLogits(
+            local_logits=local_logits,
+            vocab_parallel_group=None,
+            vocab_start_index=0,
+            vocab_end_index=local_width,
+            global_vocab_size=expected_global_vocab_size,
+            is_vocab_sharded=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
+
+    widths = _gather_vocab_widths(
+        local_width, physical_tp_group, device=local_logits.device
+    )
+    if len(widths) != tp_size or sum(widths) != expected_global_vocab_size:
+        raise ValueError(
+            "TP vocabulary shard widths do not cover the logical model vocabulary: "
+            f"widths={widths}, expected_global_vocab_size={expected_global_vocab_size}."
+        )
+    vocab_start_index = sum(widths[:tp_rank])
+    vocab_end_index = vocab_start_index + local_width
+    if vocab_end_index - vocab_start_index != local_width:
+        raise ValueError(
+            "Resolved vocabulary interval does not match the local shard width: "
+            f"interval=[{vocab_start_index}, {vocab_end_index}), local_width={local_width}."
+        )
+
+    return ResolvedVocabParallelLogits(
+        local_logits=local_logits,
+        vocab_parallel_group=physical_tp_group,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        global_vocab_size=expected_global_vocab_size,
+        is_vocab_sharded=True,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
 
 
 def _compute_distributed_log_softmax_with_grad(
@@ -162,7 +382,7 @@ class DistributedLogprob(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         softmax, target_mask, masked_target = ctx.saved_tensors
 
@@ -198,7 +418,7 @@ class DistributedLogprob(torch.autograd.Function):
             grad_input.mul_(grad_output.unsqueeze(-1))
 
         # if you add an argument to the forward method, then you must add a corresponding None here
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None
 
 
 class DistributedCrossEntropy(torch.autograd.Function):
@@ -828,6 +1048,174 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             )
 
         return grad_input, None, None, None, None, None, None
+
+
+def get_target_logprobs_from_vocab_parallel_logits(
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    vocab_start_index: int,
+    vocab_end_index: int,
+    global_vocab_size: int,
+    chunk_size: Optional[int] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    inference_only: bool = False,
+) -> torch.Tensor:
+    """Return log probabilities for already aligned target token IDs.
+
+    This helper owns vocabulary-parallel selection only. It does not roll,
+    shard, gather, or trim the sequence dimension.
+
+    Args:
+        vocab_parallel_logits: Local logits with shape ``[B, S, V_local]``.
+        target: Already aligned target IDs with shape ``[B, S]``.
+        tp_group: Vocabulary-parallel process group, or ``None`` for a full
+            local vocabulary.
+        vocab_start_index: Inclusive global ID of the first local token.
+        vocab_end_index: Exclusive global ID after the local vocabulary.
+        global_vocab_size: Logical model output vocabulary width.
+        chunk_size: Optional sequence chunk size.
+        sampling_params: Optional top-k/top-p filtering configuration.
+        inference_only: Whether the result must avoid constructing an
+            autograd graph.
+
+    Returns:
+        A float32 tensor with shape ``[B, S]``.
+    """
+    if vocab_parallel_logits.ndim != 3:
+        raise ValueError(
+            "vocab_parallel_logits must have shape [B, S, V], got "
+            f"{vocab_parallel_logits.shape}."
+        )
+    if target.ndim != 2 or target.shape != vocab_parallel_logits.shape[:2]:
+        raise ValueError(
+            "target must match the logits [B, S] prefix, got "
+            f"target={target.shape}, logits={vocab_parallel_logits.shape}."
+        )
+    if target.dtype != torch.long:
+        raise TypeError(f"target must have dtype torch.long, got {target.dtype}.")
+    if global_vocab_size <= 0:
+        raise ValueError(
+            f"global_vocab_size must be positive, got {global_vocab_size}."
+        )
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive when set, got {chunk_size}.")
+
+    local_width = int(vocab_parallel_logits.shape[-1])
+    if local_width <= 0 or vocab_end_index - vocab_start_index != local_width:
+        raise ValueError(
+            "The vocabulary interval must match the local logits width, got "
+            f"interval=[{vocab_start_index}, {vocab_end_index}), local_width={local_width}."
+        )
+    if not 0 <= vocab_start_index < vocab_end_index <= global_vocab_size:
+        raise ValueError(
+            "Invalid vocabulary interval "
+            f"[{vocab_start_index}, {vocab_end_index}) for global size {global_vocab_size}."
+        )
+
+    target = target.to(device=vocab_parallel_logits.device)
+    if target.numel() > 0:
+        target_min = int(target.min().item())
+        target_max = int(target.max().item())
+        if target_min < 0 or target_max >= global_vocab_size:
+            raise ValueError(
+                "Target token IDs must lie within the logical model vocabulary, "
+                f"got min={target_min}, max={target_max}, size={global_vocab_size}."
+            )
+
+    if target.shape[1] == 0:
+        return vocab_parallel_logits.new_empty(
+            target.shape, dtype=torch.float32, requires_grad=False
+        )
+
+    execution_context = torch.no_grad() if inference_only else nullcontext()
+    with execution_context:
+        if tp_group is None:
+            if vocab_start_index != 0 or vocab_end_index != global_vocab_size:
+                raise ValueError(
+                    "A full-vocabulary local result must own [0, global_vocab_size), "
+                    f"got [{vocab_start_index}, {vocab_end_index})."
+                )
+            effective_chunk_size = chunk_size or int(target.shape[1])
+            out_chunks: list[torch.Tensor] = []
+            for start in range(0, int(target.shape[1]), effective_chunk_size):
+                end = min(int(target.shape[1]), start + effective_chunk_size)
+                logits_chunk = vocab_parallel_logits[:, start:end, :].to(
+                    dtype=torch.float32
+                )
+                logits_chunk, _ = apply_top_k_top_p(
+                    logits_chunk,
+                    top_k=(
+                        sampling_params.top_k if sampling_params is not None else None
+                    ),
+                    top_p=(
+                        sampling_params.top_p if sampling_params is not None else 1.0
+                    ),
+                )
+                log_probs = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
+                out_chunks.append(
+                    log_probs.gather(
+                        dim=-1,
+                        index=target[:, start:end].unsqueeze(-1),
+                    ).squeeze(-1)
+                )
+            return (
+                torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+            )
+
+        tp_size = torch.distributed.get_world_size(tp_group)
+        if tp_size <= 1:
+            raise ValueError(
+                "tp_group must be None for a full-vocabulary or one-rank result."
+            )
+
+        if need_top_k_or_top_p_filtering(sampling_params):
+            widths = _gather_vocab_widths(
+                local_width, tp_group, device=vocab_parallel_logits.device
+            )
+            if len(set(widths)) != 1 or sum(widths) != global_vocab_size:
+                raise ValueError(
+                    "Top-k/top-p vocabulary all-to-all requires equal TP shard widths, "
+                    f"got widths={widths}, global_vocab_size={global_vocab_size}."
+                )
+            if chunk_size is not None:
+                return ChunkedDistributedLogprobWithSampling.apply(  # type: ignore[no-any-return]
+                    vocab_parallel_logits,
+                    target,
+                    tp_group,
+                    sampling_params.top_k,
+                    sampling_params.top_p,
+                    chunk_size,
+                    inference_only,
+                ).contiguous()
+            return DistributedLogprobWithSampling.apply(  # type: ignore[no-any-return]
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                sampling_params.top_k,
+                sampling_params.top_p,
+                inference_only,
+            ).contiguous()
+
+        if chunk_size is not None:
+            return ChunkedDistributedLogprob.apply(  # type: ignore[no-any-return]
+                vocab_parallel_logits,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                tp_group,
+                inference_only,
+            ).contiguous()
+        return DistributedLogprob.apply(  # type: ignore[no-any-return]
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            inference_only,
+        ).contiguous()
 
 
 def dtensor_from_parallel_logits_to_logprobs(
@@ -1651,6 +2039,7 @@ def distributed_vocab_topk(
     vocab_start_index: int,
     vocab_end_index: int,
     chunk_size: Optional[int] = None,
+    global_vocab_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute global top-k over TP-sharded vocabulary logits.
 
@@ -1661,20 +2050,81 @@ def distributed_vocab_topk(
         vocab_start_index: global vocab start for this rank (inclusive)
         vocab_end_index: global vocab end for this rank (exclusive)
         chunk_size: optional chunk along sequence dim to bound memory
+        global_vocab_size: optional logical vocabulary width used to validate
+            uneven TP intervals
 
     Returns:
         topk_vals: [B, S, k]
         topk_global_indices: [B, S, k] (global token ids)
     """
-    assert vocab_end_index > vocab_start_index
+    if vocab_parallel_logits.ndim != 3:
+        raise ValueError(
+            "vocab_parallel_logits must have shape [B, S, V], got "
+            f"{vocab_parallel_logits.shape}."
+        )
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}.")
+    if vocab_end_index <= vocab_start_index:
+        raise ValueError(
+            f"Invalid vocabulary interval [{vocab_start_index}, {vocab_end_index})."
+        )
     world_size = torch.distributed.get_world_size(tp_group)
 
     B, S, V_local = vocab_parallel_logits.shape
-    V_total = V_local * world_size
-    K_eff = int(min(k, max(1, V_total)))
+    if vocab_end_index - vocab_start_index != V_local:
+        raise ValueError(
+            "The vocabulary interval must match the local logits width, got "
+            f"interval=[{vocab_start_index}, {vocab_end_index}), V_local={V_local}."
+        )
+
+    local_metadata = torch.tensor(
+        [vocab_start_index, vocab_end_index, V_local],
+        device=vocab_parallel_logits.device,
+        dtype=torch.int64,
+    )
+    gathered_metadata = [torch.empty_like(local_metadata) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_metadata, local_metadata, group=tp_group)
+    intervals = [
+        tuple(int(value) for value in item.tolist()) for item in gathered_metadata
+    ]
+    expected_start = 0
+    widths: list[int] = []
+    for start, end, width in intervals:
+        if start != expected_start or end - start != width or width <= 0:
+            raise ValueError(
+                "TP vocabulary intervals must be positive, contiguous, and rank ordered; "
+                f"got {intervals}."
+            )
+        widths.append(width)
+        expected_start = end
+    resolved_global_vocab_size = expected_start
+    if (
+        global_vocab_size is not None
+        and resolved_global_vocab_size != global_vocab_size
+    ):
+        raise ValueError(
+            "TP vocabulary intervals do not cover the expected global vocabulary, "
+            f"got {resolved_global_vocab_size}, expected {global_vocab_size}."
+        )
+    if k > resolved_global_vocab_size:
+        raise ValueError(
+            f"k={k} exceeds global vocabulary size {resolved_global_vocab_size}."
+        )
 
     if chunk_size is None:
-        chunk_size = S
+        chunk_size = max(1, S)
+    elif chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+
+    if S == 0:
+        return (
+            vocab_parallel_logits.new_empty((B, 0, k), dtype=torch.float32),
+            torch.empty(
+                (B, 0, k), device=vocab_parallel_logits.device, dtype=torch.long
+            ),
+        )
+
+    candidate_slots = min(k, max(widths))
 
     vals_chunks: list[torch.Tensor] = []
     idx_chunks: list[torch.Tensor] = []
@@ -1684,21 +2134,53 @@ def distributed_vocab_topk(
         # Upcast only the current slice to bound the fp32 working set to
         # [B, chunk_size, V_local] (chunk_size driven by logprob_chunk_size).
         logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
-        # local top-k on this TP rank
-        local_vals, local_idx_local = torch.topk(logits_chunk, min(k, V_local), dim=-1)
+        # Local candidates are padded to a common width for all_gather. Keep a
+        # separate validity bit so a real -inf logit wins ties against padding.
+        local_count = min(k, V_local)
+        local_vals, local_idx_local = torch.topk(logits_chunk, local_count, dim=-1)
         local_idx_global = local_idx_local + int(vocab_start_index)
+        local_valid = torch.ones_like(local_idx_global, dtype=torch.bool)
+        if local_count < candidate_slots:
+            padding = candidate_slots - local_count
+            local_vals = torch.nn.functional.pad(
+                local_vals, (0, padding), value=float("-inf")
+            )
+            local_idx_global = torch.nn.functional.pad(
+                local_idx_global, (0, padding), value=0
+            )
+            local_valid = torch.nn.functional.pad(
+                local_valid, (0, padding), value=False
+            )
 
         # gather candidates from all TP ranks
         gathered_vals = [torch.empty_like(local_vals) for _ in range(world_size)]
         gathered_idx = [torch.empty_like(local_idx_global) for _ in range(world_size)]
+        gathered_valid = [torch.empty_like(local_valid) for _ in range(world_size)]
         torch.distributed.all_gather(gathered_vals, local_vals, group=tp_group)
         torch.distributed.all_gather(gathered_idx, local_idx_global, group=tp_group)
+        torch.distributed.all_gather(gathered_valid, local_valid, group=tp_group)
 
         all_vals = torch.cat(gathered_vals, dim=-1)
         all_idx = torch.cat(gathered_idx, dim=-1)
+        all_valid = torch.cat(gathered_valid, dim=-1)
 
-        sel_vals, sel_pos = torch.topk(all_vals, K_eff, dim=-1)
-        sel_idx = torch.gather(all_idx, dim=-1, index=sel_pos)
+        valid_first = torch.argsort(
+            all_valid.to(torch.int8), dim=-1, descending=True, stable=True
+        )
+        all_vals = torch.gather(all_vals, dim=-1, index=valid_first)
+        all_idx = torch.gather(all_idx, dim=-1, index=valid_first)
+        all_valid = torch.gather(all_valid, dim=-1, index=valid_first)
+        value_order = torch.argsort(all_vals, dim=-1, descending=True, stable=True)[
+            ..., :k
+        ]
+        sel_vals = torch.gather(all_vals, dim=-1, index=value_order)
+        sel_idx = torch.gather(all_idx, dim=-1, index=value_order)
+        sel_valid = torch.gather(all_valid, dim=-1, index=value_order)
+        if not bool(sel_valid.all().item()):
+            raise RuntimeError(
+                "Distributed top-k selected a padded candidate despite a valid "
+                "global vocabulary interval."
+            )
 
         vals_chunks.append(sel_vals)
         idx_chunks.append(sel_idx)
@@ -1778,9 +2260,7 @@ def gather_logits_at_global_indices(
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
         if tp_group is not None:
-            torch.distributed.all_reduce(
-                local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            local_vals = group_all_reduce_sum_with_grad(local_vals, tp_group)
         out_chunks.append(local_vals)
 
     gathered_logits = (
@@ -1798,6 +2278,151 @@ def gather_logits_at_global_indices(
             gathered_logits = gathered_logits[:, :-pad_len, :]
 
     return gathered_logits
+
+
+def get_student_distillation_statistics_from_vocab_parallel_logits(
+    student_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    vocab_start_index: int,
+    vocab_end_index: int,
+    global_vocab_size: int,
+    zero_outside_topk: bool,
+    calculate_entropy: bool,
+    chunk_size: Optional[int] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Compute local-sequence student distillation statistics.
+
+    The function handles vocabulary parallelism only. ``teacher_topk_indices``
+    must already use the same local sequence positions as ``student_logits``.
+    """
+    if student_logits.ndim != 3:
+        raise ValueError(
+            f"student_logits must have shape [B, S, V], got {student_logits.shape}."
+        )
+    if teacher_topk_indices.ndim != 3:
+        raise ValueError(
+            "teacher_topk_indices must have shape [B, S, K], got "
+            f"{teacher_topk_indices.shape}."
+        )
+    if teacher_topk_indices.shape[:2] != student_logits.shape[:2]:
+        raise ValueError(
+            "Teacher indices must match the student [B, S] prefix, got "
+            f"teacher={teacher_topk_indices.shape}, student={student_logits.shape}."
+        )
+    if teacher_topk_indices.dtype != torch.long:
+        raise TypeError(
+            "teacher_topk_indices must have dtype torch.long, got "
+            f"{teacher_topk_indices.dtype}."
+        )
+    if teacher_topk_indices.shape[-1] <= 0:
+        raise ValueError("Distillation top-k must be positive.")
+    if calculate_entropy and not zero_outside_topk:
+        raise ValueError("calculate_entropy=True requires zero_outside_topk=True.")
+    if global_vocab_size <= 0:
+        raise ValueError(
+            f"global_vocab_size must be positive, got {global_vocab_size}."
+        )
+
+    local_width = int(student_logits.shape[-1])
+    if local_width <= 0 or vocab_end_index - vocab_start_index != local_width:
+        raise ValueError(
+            "The student vocabulary interval must match its local logits width, got "
+            f"interval=[{vocab_start_index}, {vocab_end_index}), width={local_width}."
+        )
+    if not 0 <= vocab_start_index < vocab_end_index <= global_vocab_size:
+        raise ValueError(
+            "Invalid student vocabulary interval "
+            f"[{vocab_start_index}, {vocab_end_index}) for size {global_vocab_size}."
+        )
+
+    teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
+    if teacher_topk_indices.numel() > 0:
+        min_index = int(teacher_topk_indices.min().item())
+        max_index = int(teacher_topk_indices.max().item())
+        if min_index < 0 or max_index >= global_vocab_size:
+            raise ValueError(
+                "Teacher top-k IDs must lie within the student model vocabulary, "
+                f"got min={min_index}, max={max_index}, size={global_vocab_size}."
+            )
+
+    sequence_length = int(student_logits.shape[1])
+    if sequence_length <= 0:
+        raise ValueError("Distillation requires a non-empty sequence dimension.")
+    effective_chunk_size = (
+        max(1, min(sequence_length, 1024)) if chunk_size is None else chunk_size
+    )
+    if effective_chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {effective_chunk_size}.")
+
+    if tp_group is None:
+        if vocab_start_index != 0 or vocab_end_index != global_vocab_size:
+            raise ValueError(
+                "A full-vocabulary student result must own [0, global_vocab_size), "
+                f"got [{vocab_start_index}, {vocab_end_index})."
+            )
+        topk_chunks: list[torch.Tensor] = []
+        entropy_chunks: list[torch.Tensor] = []
+        for start in range(0, sequence_length, effective_chunk_size):
+            end = min(sequence_length, start + effective_chunk_size)
+            logits_chunk = student_logits[:, start:end, :].to(torch.float32)
+            index_chunk = teacher_topk_indices[:, start:end, :]
+            if zero_outside_topk:
+                log_probs = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
+                topk_chunks.append(log_probs.gather(dim=-1, index=index_chunk))
+                if calculate_entropy:
+                    entropy_chunks.append((log_probs.exp() * log_probs).sum(dim=-1))
+            else:
+                selected_logits = logits_chunk.gather(dim=-1, index=index_chunk)
+                topk_chunks.append(
+                    torch.nn.functional.log_softmax(selected_logits, dim=-1)
+                )
+        topk_logprobs = (
+            torch.cat(topk_chunks, dim=1) if len(topk_chunks) > 1 else topk_chunks[0]
+        )
+        entropy = None
+        if calculate_entropy:
+            entropy = (
+                torch.cat(entropy_chunks, dim=1)
+                if len(entropy_chunks) > 1
+                else entropy_chunks[0]
+            )
+        return topk_logprobs, entropy
+
+    if torch.distributed.get_world_size(tp_group) <= 1:
+        raise ValueError("tp_group must be None for a one-rank vocabulary result.")
+
+    if zero_outside_topk:
+        topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore[no-any-return]
+            student_logits,
+            teacher_topk_indices,
+            vocab_start_index,
+            vocab_end_index,
+            effective_chunk_size,
+            tp_group,
+            False,
+        )
+        entropy = None
+        if calculate_entropy:
+            entropy = ChunkedDistributedEntropy.apply(  # type: ignore[no-any-return]
+                student_logits,
+                effective_chunk_size,
+                tp_group,
+                False,
+            )
+        return topk_logprobs, entropy
+
+    selected_logits = gather_logits_at_global_indices(
+        student_logits,
+        teacher_topk_indices,
+        tp_group=tp_group,
+        cp_group=None,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        chunk_size=effective_chunk_size,
+    )
+    return torch.nn.functional.log_softmax(selected_logits, dim=-1), None
 
 
 def get_distillation_topk_logprobs_from_logits(

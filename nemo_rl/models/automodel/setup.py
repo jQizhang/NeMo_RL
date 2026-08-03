@@ -367,6 +367,12 @@ def validate_and_prepare_config(
             "Context parallel is not supported for sequence packing. "
             "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
         )
+    if cp_size > 1 and is_reward_model:
+        raise ValueError(
+            "Automodel reward/value models do not support context parallelism; "
+            "their scalar or token-classification heads have no validated CP "
+            "output-gather contract. Set context_parallel_size=1."
+        )
 
     if sequence_parallel_enabled and tp_size == 1:
         print(

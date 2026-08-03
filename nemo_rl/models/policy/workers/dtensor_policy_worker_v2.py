@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -21,12 +20,6 @@ from typing import Any, Generator, Iterable, Optional
 import ray
 import torch
 from nemo_automodel.components._peft.lora import LinearLoRA
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    create_context_parallel_ctx,
-)
-from nemo_automodel.components.distributed.context_parallel.utils import (
-    get_train_context as get_train_context_automodel,
-)
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
@@ -36,9 +29,11 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.x_token.loss_utils import validate_xtoken_window_contract
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import validate_token_ids_in_vocab
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
@@ -60,12 +55,16 @@ from nemo_rl.models.automodel.train import (
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
+    get_model_output_vocab_size,
+    prepare_model_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ScoreOutputSpec,
+    TeacherIPCWorkerResult,
+    TeacherLogitsIPCHandle,
 )
 from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
@@ -171,35 +170,6 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
-@contextlib.contextmanager
-def get_train_context(
-    cp_size: int,
-    cp_mesh: Any,
-    cp_buffers: list,
-    sequence_dim: int,
-    dtype: torch.dtype,
-    autocast_enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Create combined context manager for training with context parallel and autocast."""
-    with contextlib.ExitStack() as stack:
-        context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=cp_mesh,
-                cp_buffers=cp_buffers,
-                cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                cp_no_restore_buffers=set(cp_buffers),
-            )
-
-        stack.enter_context(
-            get_train_context_automodel(False, False, context_parallel_ctx)()
-        )
-        if autocast_enabled:
-            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
-        yield
-
-
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(
@@ -265,6 +235,14 @@ class DTensorPolicyWorkerV2Impl(
         else:
             self.tokenizer = result
             self.processor = None
+        padding_token_id = self.tokenizer.pad_token_id
+        if padding_token_id is None:
+            padding_token_id = self.tokenizer.eos_token_id
+        if padding_token_id is None:
+            raise ValueError(
+                "The Automodel CP sharder requires a tokenizer pad or EOS token ID."
+            )
+        self.padding_token_id = int(padding_token_id)
         self.is_vlm = self.processor is not None
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
@@ -309,6 +287,8 @@ class DTensorPolicyWorkerV2Impl(
         self.dp_size = distributed_context.dp_size
         self.tp_size = distributed_context.tp_size
         self.cp_size = distributed_context.cp_size
+        self.cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
+        self.dp_group = self.dp_mesh.get_group() if self.dp_size > 1 else None
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
@@ -371,6 +351,9 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+        self.model_output_vocab_size = (
+            None if self._is_reward_model else get_model_output_vocab_size(self.model)
+        )
 
         # Rollout topology constant for SGLang colocated refit: set once via
         # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
@@ -393,6 +376,21 @@ class DTensorPolicyWorkerV2Impl(
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
+
+    def _autocast_context(self) -> AbstractContextManager[Any]:
+        """Return the worker-owned precision context for one microbatch."""
+        if not self.autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.dtype)
+
+    def _require_model_output_vocab_size(self) -> int:
+        """Return the language-model head width for vocabulary operations."""
+        if self.model_output_vocab_size is None:
+            raise ValueError(
+                "This reward-model worker does not expose language-model vocabulary "
+                "logits. Use score() instead."
+            )
+        return self.model_output_vocab_size
 
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
@@ -424,7 +422,37 @@ class DTensorPolicyWorkerV2Impl(
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
+        sequence_dim, sequence_length = check_sequence_dim(
+            data, skip_keys=check_dim_skip_keys
+        )
+        if loss_fn.input_type in {
+            LossInputType.LOGPROB,
+            LossInputType.DISTILLATION_CROSS_TOKENIZER,
+        }:
+            validate_token_ids_in_vocab(
+                data["input_ids"],
+                global_vocab_size=self._require_model_output_vocab_size(),
+                name="input_ids",
+            )
+        elif loss_fn.input_type == LossInputType.DISTILLATION:
+            validate_token_ids_in_vocab(
+                data["teacher_topk_indices"],
+                global_vocab_size=self._require_model_output_vocab_size(),
+                name="teacher_topk_indices",
+            )
+        if loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
+            projection_paths = getattr(loss_fn, "projection_matrix_paths", None)
+            if not isinstance(projection_paths, list):
+                raise ValueError(
+                    "Cross-tokenizer loss functions must expose a list-valued "
+                    "projection_matrix_paths contract."
+                )
+            validate_xtoken_window_contract(
+                data,
+                projection_matrix_paths=projection_paths,
+                student_seq_len=sequence_length,
+                context_parallel_group=self.cp_group,
+            )
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -438,25 +466,16 @@ class DTensorPolicyWorkerV2Impl(
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self.model_output_vocab_size,
+            padding_token_id=self.padding_token_id,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
+            cp_group=self.cp_group,
+            dp_group=self.dp_group,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
-
-        # Create train context factory
-        def train_context_fn(processed_inputs):
-            return get_train_context(
-                cp_size=self.cp_size,
-                cp_mesh=self.cp_mesh,
-                cp_buffers=processed_inputs.cp_buffers,
-                sequence_dim=sequence_dim,
-                dtype=self.dtype,
-                autocast_enabled=self.autocast_enabled,
-            )
 
         # Setup cache clearing callback if configured
         empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -499,7 +518,6 @@ class DTensorPolicyWorkerV2Impl(
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
-                    cp_size=self.cp_size,
                 )
 
                 # Use automodel_forward_backward for the training loop
@@ -507,6 +525,9 @@ class DTensorPolicyWorkerV2Impl(
                     model=self.model,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
                     is_reward_model=self._is_reward_model,
                     allow_flash_attn_args=self.allow_flash_attn_args,
@@ -517,7 +538,6 @@ class DTensorPolicyWorkerV2Impl(
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
                     num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -611,6 +631,11 @@ class DTensorPolicyWorkerV2Impl(
 
         # Validate sequence dimension
         sequence_dim, seq_dim_size = check_sequence_dim(data)
+        validate_token_ids_in_vocab(
+            data["input_ids"],
+            global_vocab_size=self._require_model_output_vocab_size(),
+            name="input_ids",
+        )
 
         all_log_probs = []
         self.model.eval()
@@ -618,9 +643,9 @@ class DTensorPolicyWorkerV2Impl(
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self._require_model_output_vocab_size(),
+            padding_token_id=self.padding_token_id,
             cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
@@ -635,27 +660,25 @@ class DTensorPolicyWorkerV2Impl(
                 logprob_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -684,6 +707,8 @@ class DTensorPolicyWorkerV2Impl(
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        if self.cp_size > 1:
+            raise ValueError("DTensor v2 reward-model score does not support CP>1.")
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
@@ -704,28 +729,26 @@ class DTensorPolicyWorkerV2Impl(
                 global_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             all_rm_scores = []
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    is_reward_model=True,
+                    allow_flash_attn_args=False,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=True,
-                        allow_flash_attn_args=False,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -778,9 +801,8 @@ class DTensorPolicyWorkerV2Impl(
         # Create top-k post-processor
         topk_post_processor = TopkLogitsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
+            expected_global_vocab_size=self._require_model_output_vocab_size(),
             cp_size=self.cp_size,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
@@ -795,27 +817,25 @@ class DTensorPolicyWorkerV2Impl(
                 topk_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -863,17 +883,16 @@ class DTensorPolicyWorkerV2Impl(
         self,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
-    ) -> dict[str, Any]:
+    ) -> TeacherIPCWorkerResult:
         """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
 
         Used by cross-tokenizer distillation; supports heterogeneous teacher
         TP/CP. Each microbatch writes into slot
         ``self._teacher_ipc_storage[buf_idx]`` and shares one cached IPC
-        handle. Returns ``{"per_sample_handles": list, "dp_rank": int}`` where
-        each handle carries ``buf_idx`` and ``sample_index_in_buf`` for the
-        consumer to index the slot view, plus the TP/CP shard metadata
-        (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
-        route shards across heterogeneous teacher/student TP/CP.
+        handle. Returns the local sample count, DP rank, and zero or one handle
+        per sample from this worker. Each handle carries its storage slot plus
+        TP/CP rectangle metadata used to route shards across heterogeneous
+        teacher/student topologies.
         """
         forward_batch_size = (
             micro_batch_size
@@ -881,31 +900,34 @@ class DTensorPolicyWorkerV2Impl(
             else self.cfg["logprob_batch_size"]
         )
         sequence_dim, seq_dim_size = check_sequence_dim(data)
-        target_local_seq = (
-            seq_dim_size // self.cp_size if self.cp_size > 1 else seq_dim_size
-        )
+        if seq_dim_size % self.cp_size != 0:
+            raise ValueError(
+                "Full-logits IPC requires equal contiguous CP windows; "
+                f"sequence length {seq_dim_size} is not divisible by CP size "
+                f"{self.cp_size}."
+            )
+        target_local_seq = seq_dim_size // self.cp_size
 
         self.model.eval()
 
         post_processor = FullLogitsPostProcessor(
-            cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
+            expected_global_vocab_size=self._require_model_output_vocab_size(),
+            producer_cp_rank=(
+                self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+            ),
+            producer_cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
         )
 
-        tp_rank = self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0
         cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
         dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
         world_rank = torch.distributed.get_rank()
-        full_seq_len = target_local_seq * self.cp_size
-        global_seq_start = cp_rank * full_seq_len // self.cp_size
 
-        per_sample_handles: list[dict[str, Any]] = []
+        per_sample_handles: list[TeacherLogitsIPCHandle] = []
         storage: Optional[torch.Tensor] = None
         payload_ipc: Optional[tuple[Any, ...]] = None
+        contributor_layout: Optional[tuple[Any, ...]] = None
         with torch.no_grad():
             data.to("cuda")
             processed_iterator, iterator_len = get_microbatch_iterator(
@@ -914,36 +936,60 @@ class DTensorPolicyWorkerV2Impl(
                 forward_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
             for buf_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
-                    vals, _metrics, _ = forward_with_post_processing_fn(
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.padding_token_id,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
+                    shard, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
                 if buf_idx >= iterator_len:
                     continue
-                # Pad to canonical seq so the cached IPC handle stays shape-stable.
-                pad_needed = target_local_seq - vals.shape[1]
-                if pad_needed > 0:
-                    vals = torch.nn.functional.pad(
-                        vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                vals = shard.local_logits
+                if vals.shape[1] != target_local_seq:
+                    raise ValueError(
+                        "Full-logits postprocessing returned an unexpected local "
+                        f"sequence length: expected {target_local_seq}, got "
+                        f"{vals.shape[1]}."
                     )
                 batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
+
+                contributes = shard.vocab_sharded or shard.tp_rank == 0
+                layout = (
+                    contributes,
+                    shard.tp_rank,
+                    shard.tp_size,
+                    shard.vocab_start_index,
+                    shard.vocab_end_index,
+                    shard.full_vocab_size,
+                    shard.global_seq_start,
+                    shard.full_seq_len,
+                    shard.vocab_sharded,
+                    shard.sequence_sharded,
+                )
+                if contributor_layout is None:
+                    contributor_layout = layout
+                elif contributor_layout != layout:
+                    raise ValueError(
+                        "Full-logits producer layout changed across microbatches: "
+                        f"first={contributor_layout}, current={layout}."
+                    )
+                if not contributes:
+                    del vals, shard
+                    continue
 
                 self._teacher_ipc_storage, self._teacher_ipc_handle = (
                     ensure_teacher_ipc_buffer(
@@ -959,13 +1005,11 @@ class DTensorPolicyWorkerV2Impl(
                 )
                 storage = self._teacher_ipc_storage
                 payload_ipc = self._teacher_ipc_handle
+                assert storage is not None and payload_ipc is not None
                 storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
                     vals
                 )
                 del vals
-                full_vocab_size = local_vocab_size * self.tp_size
-                vocab_start_index = tp_rank * local_vocab_size
-                vocab_end_index = (tp_rank + 1) * local_vocab_size
                 for sample_index_in_buf in range(batch_size_mb):
                     per_sample_handles.append(
                         {
@@ -975,26 +1019,40 @@ class DTensorPolicyWorkerV2Impl(
                             "storage_shape": tuple(storage.shape),
                             "actual_shape": (target_local_seq, local_vocab_size),
                             "dtype": storage.dtype,
-                            "tp_rank": tp_rank,
+                            "tp_rank": shard.tp_rank,
                             "cp_rank": cp_rank,
-                            "tp_size": self.tp_size,
+                            "tp_size": shard.tp_size,
                             "cp_size": self.cp_size,
                             "world_rank": world_rank,
-                            "vocab_start_index": vocab_start_index,
-                            "vocab_end_index": vocab_end_index,
-                            "global_seq_start": global_seq_start,
-                            "full_vocab_size": full_vocab_size,
-                            "full_seq_len": full_seq_len,
-                            "vocab_sharded": self.tp_size > 1,
-                            "sequence_sharded": self.cp_size > 1,
+                            "vocab_start_index": shard.vocab_start_index,
+                            "vocab_end_index": shard.vocab_end_index,
+                            "global_seq_start": shard.global_seq_start,
+                            "full_vocab_size": shard.full_vocab_size,
+                            "full_seq_len": shard.full_seq_len,
+                            "vocab_sharded": shard.vocab_sharded,
+                            "sequence_sharded": shard.sequence_sharded,
                         }
                     )
+                del shard
+        if contributor_layout is None:
+            raise ValueError("Full-logits IPC received no real microbatches.")
+        if contributor_layout[0] and len(per_sample_handles) != data.size:
+            raise ValueError(
+                "A contributing full-logits worker must emit one handle per "
+                f"sample, got {len(per_sample_handles)} handles for {data.size} samples."
+            )
+        if not contributor_layout[0] and per_sample_handles:
+            raise RuntimeError("A non-contributing TP replica emitted IPC handles.")
         # The storage copies above are async on the current stream; force them
         # to complete before the IPC handles are consumed by the student
         # process, so the consumer can't observe a partially written buffer
         # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
-        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+        return {
+            "per_sample_handles": per_sample_handles,
+            "dp_rank": dp_rank,
+            "num_samples": data.size,
+        }
 
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""

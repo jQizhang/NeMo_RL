@@ -30,16 +30,12 @@ from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
+    LocalizedAlignment,
     build_exact_token_map,
     chunk_average_log_probs,
-    localize_alignment,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
-    cp_shift_next,
-)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -2457,7 +2453,7 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
         "kd_loss_mode": "sum",
         "alpha": 1.0,
         "normalize_teacher_by_vocab": False,
-        "student_vocab_size": _CT_V_STUDENT,
+        "student_tokenizer_vocab_size": _CT_V_STUDENT,
         "projection_matrix_paths": [projection_path],
         "teacher_vocab_sizes": [_CT_V_TEACHER],
         "teacher_weights": [1.0],
@@ -2499,19 +2495,23 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
 
 
 def _ct_gold_prep(logits, teacher_logits, data):
-    """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
-    gold path: CP-relaid student logits + localized, next-token-shifted align."""
-    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
-    align = localize_alignment(
-        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
+    """Build the single-rank precomputed alignment consumed by the gold path."""
+    student_chunk_id = data["alignment_student_chunk_id"].roll(-1, dims=1).clone()
+    teacher_chunk_id = data["alignment_teacher_chunk_id"].roll(-1, dims=1).clone()
+    student_chunk_id[:, -1] = -1
+    teacher_chunk_id[:, -1] = -1
+    teacher_shape = teacher_chunk_id.shape
+    align = LocalizedAlignment(
+        sample_mask=data["sample_mask"],
+        student_chunk_id=student_chunk_id,
+        teacher_chunk_id=teacher_chunk_id,
+        pair_valid=data["alignment_pair_valid"],
+        pair_is_correct=data["alignment_pair_is_correct"],
+        teacher_token_mask=torch.ones(teacher_shape),
+        teacher_next_token_ids=torch.zeros(teacher_shape, dtype=torch.long),
+        teacher_next_token_mask=torch.ones(teacher_shape),
     )
-    align.student_chunk_id = cp_shift_next(
-        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
-        None,
-        fill=-1,
-    )
-    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
-    return student_logits, align
+    return logits, align
 
 
 def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
@@ -2625,60 +2625,6 @@ def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
     cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
         CrossTokenizerDistillationLossFn(cfg)
-
-
-def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
-    """_compute_ce on uniform logits equals log(V_student) per valid token."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
-    b, t_s = 1, 5
-    logits = torch.zeros(b, t_s, _CT_V_STUDENT)  # uniform -> CE == log(V)
-    data = BatchedDataDict(
-        {
-            "input_ids": torch.randint(0, _CT_V_STUDENT, (b, t_s)),
-            "token_mask": torch.ones(b, t_s),
-            "sample_mask": torch.ones(b),
-        }
-    )
-    gvt = (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)).sum()
-    ce = loss_fn._compute_ce(logits, data, gvt)
-    assert torch.allclose(ce, torch.log(torch.tensor(float(_CT_V_STUDENT))), atol=1e-5)
-
-
-def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
-    """A masked sample must not contribute to _compute_ce: the B=2 result with
-    sample 1 masked equals the CE over sample 0 alone."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
-    b, t_s = 2, 5
-    torch.manual_seed(0)
-    logits = torch.randn(b, t_s, _CT_V_STUDENT)
-    input_ids = torch.randint(0, _CT_V_STUDENT, (b, t_s))
-    token_mask = torch.ones(b, t_s)
-
-    data_masked = BatchedDataDict(
-        {
-            "input_ids": input_ids,
-            "token_mask": token_mask,
-            "sample_mask": torch.tensor([1.0, 0.0]),
-        }
-    )
-    gvt_masked = (token_mask[:, 1:] * data_masked["sample_mask"].unsqueeze(-1)).sum()
-    ce_masked = loss_fn._compute_ce(logits, data_masked, gvt_masked)
-
-    data_single = BatchedDataDict(
-        {
-            "input_ids": input_ids[:1],
-            "token_mask": token_mask[:1],
-            "sample_mask": torch.tensor([1.0]),
-        }
-    )
-    gvt_single = (token_mask[:1, 1:] * data_single["sample_mask"].unsqueeze(-1)).sum()
-    ce_single = loss_fn._compute_ce(logits[:1], data_single, gvt_single)
-
-    assert torch.allclose(ce_masked, ce_single, atol=1e-6)
 
 
 # ── Metric-normalization advertisement (PR #2683) ─────────────────────────

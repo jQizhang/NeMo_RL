@@ -44,6 +44,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
+    TeacherIPCPerSample,
     TopkLogitsOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
@@ -668,7 +669,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[TeacherIPCPerSample]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
         Used by cross-tokenizer distillation; supports heterogeneous teacher

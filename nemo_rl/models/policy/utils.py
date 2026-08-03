@@ -54,6 +54,11 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.policy.interfaces import (
+    TeacherIPCPerSample,
+    TeacherIPCWorkerResult,
+    TeacherLogitsIPCHandle,
+)
 
 # an automodel factory for loading the huggingface models from correct class
 
@@ -304,9 +309,167 @@ def ensure_teacher_ipc_buffer(
     return storage, handle
 
 
+def _validate_teacher_shard_coverage(
+    shards: list[TeacherLogitsIPCHandle],
+    *,
+    dp_rank: int,
+    sample_idx: int,
+) -> None:
+    """Validate that producer rectangles cover one full teacher-logit sample."""
+    if not shards:
+        raise ValueError(
+            f"dp={dp_rank}, sample={sample_idx}: no teacher IPC shards were emitted."
+        )
+
+    first = shards[0]
+    full_seq_len = int(first["full_seq_len"])
+    full_vocab_size = int(first["full_vocab_size"])
+    tp_size = int(first["tp_size"])
+    cp_size = int(first["cp_size"])
+    vocab_sharded = bool(first["vocab_sharded"])
+    sequence_sharded = bool(first["sequence_sharded"])
+    dtype = first["dtype"]
+    if full_seq_len <= 0 or full_vocab_size <= 0 or tp_size <= 0 or cp_size <= 0:
+        raise ValueError(
+            f"dp={dp_rank}, sample={sample_idx}: invalid teacher topology or shape "
+            f"(T={full_seq_len}, V={full_vocab_size}, TP={tp_size}, CP={cp_size})."
+        )
+
+    rectangles: list[tuple[int, int, int, int]] = []
+    world_ranks: set[int] = set()
+    topology_coordinates: set[tuple[int, int]] = set()
+    covered_area = 0
+    for shard in shards:
+        invariant = (
+            int(shard["full_seq_len"]),
+            int(shard["full_vocab_size"]),
+            int(shard["tp_size"]),
+            int(shard["cp_size"]),
+            bool(shard["vocab_sharded"]),
+            bool(shard["sequence_sharded"]),
+            shard["dtype"],
+        )
+        expected = (
+            full_seq_len,
+            full_vocab_size,
+            tp_size,
+            cp_size,
+            vocab_sharded,
+            sequence_sharded,
+            dtype,
+        )
+        if invariant != expected:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: inconsistent teacher shard "
+                f"metadata, expected {expected}, got {invariant}."
+            )
+
+        world_rank = int(shard["world_rank"])
+        if world_rank in world_ranks:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: worker rank {world_rank} "
+                "contributed more than one shard."
+            )
+        world_ranks.add(world_rank)
+
+        tp_rank = int(shard["tp_rank"])
+        cp_rank = int(shard["cp_rank"])
+        if not 0 <= tp_rank < tp_size or not 0 <= cp_rank < cp_size:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: invalid producer coordinate "
+                f"(TP={tp_rank}/{tp_size}, CP={cp_rank}/{cp_size})."
+            )
+        coordinate = (tp_rank, cp_rank)
+        if coordinate in topology_coordinates:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: producer coordinate "
+                f"{coordinate} contributed more than one shard."
+            )
+        topology_coordinates.add(coordinate)
+
+        storage_shape = tuple(int(x) for x in shard["storage_shape"])
+        if len(storage_shape) != 4 or any(size <= 0 for size in storage_shape):
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: teacher IPC storage must "
+                f"have positive [M, B, S, V] shape, got {storage_shape}."
+            )
+        buf_idx = int(shard["buf_idx"])
+        sample_index_in_buf = int(shard["sample_index_in_buf"])
+        if not 0 <= buf_idx < storage_shape[0]:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: IPC buffer index {buf_idx} "
+                f"is outside storage shape {storage_shape}."
+            )
+        if not 0 <= sample_index_in_buf < storage_shape[1]:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: IPC sample index "
+                f"{sample_index_in_buf} is outside storage shape {storage_shape}."
+            )
+
+        seq_start = int(shard["global_seq_start"])
+        seq_len, vocab_width = (int(x) for x in shard["actual_shape"])
+        seq_end = seq_start + seq_len
+        vocab_start = int(shard["vocab_start_index"])
+        vocab_end = int(shard["vocab_end_index"])
+        if seq_len <= 0 or vocab_width <= 0:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: empty teacher shard "
+                f"shape {shard['actual_shape']}."
+            )
+        if seq_len > storage_shape[2] or vocab_width > storage_shape[3]:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: actual shard shape "
+                f"{shard['actual_shape']} exceeds IPC storage shape {storage_shape}."
+            )
+        if not 0 <= seq_start < seq_end <= full_seq_len:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: invalid sequence interval "
+                f"[{seq_start}, {seq_end}) for full length {full_seq_len}."
+            )
+        if not 0 <= vocab_start < vocab_end <= full_vocab_size:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: invalid vocabulary interval "
+                f"[{vocab_start}, {vocab_end}) for full width {full_vocab_size}."
+            )
+        if vocab_end - vocab_start != vocab_width:
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: actual vocabulary width "
+                f"{vocab_width} does not match [{vocab_start}, {vocab_end})."
+            )
+        if not sequence_sharded and (seq_start != 0 or seq_end != full_seq_len):
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: unsharded sequence metadata "
+                f"must cover [0, {full_seq_len}), got [{seq_start}, {seq_end})."
+            )
+        if not vocab_sharded and (vocab_start != 0 or vocab_end != full_vocab_size):
+            raise ValueError(
+                f"dp={dp_rank}, sample={sample_idx}: unsharded vocabulary "
+                f"metadata must cover [0, {full_vocab_size}), got "
+                f"[{vocab_start}, {vocab_end})."
+            )
+        rectangles.append((seq_start, seq_end, vocab_start, vocab_end))
+        covered_area += seq_len * vocab_width
+
+    for index, lhs in enumerate(rectangles):
+        for rhs in rectangles[index + 1 :]:
+            seq_overlap = max(lhs[0], rhs[0]) < min(lhs[1], rhs[1])
+            vocab_overlap = max(lhs[2], rhs[2]) < min(lhs[3], rhs[3])
+            if seq_overlap and vocab_overlap:
+                raise ValueError(
+                    f"dp={dp_rank}, sample={sample_idx}: overlapping teacher "
+                    f"shards {lhs} and {rhs}."
+                )
+    expected_area = full_seq_len * full_vocab_size
+    if covered_area != expected_area:
+        raise ValueError(
+            f"dp={dp_rank}, sample={sample_idx}: teacher shards cover area "
+            f"{covered_area}, expected {expected_area}."
+        )
+
+
 def aggregate_per_sample_handles(
-    worker_results: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    worker_results: list[TeacherIPCWorkerResult],
+) -> list[TeacherIPCPerSample]:
     """Flatten teacher per-sample IPC handles into a global-batch-ordered list.
 
     Each worker returns ``{"dp_rank": int, "per_sample_handles": list}`` where
@@ -318,30 +481,60 @@ def aggregate_per_sample_handles(
     teacher's DP degree. Element ``i`` is ``{"teacher_shards": [shard, ...]}``
     holding all TP×CP shards of global sample ``i``.
     """
-    handles_by_dp_rank: dict[int, list[list[dict[str, Any]]]] = {}
+    if not worker_results:
+        raise ValueError("Teacher IPC aggregation requires at least one worker result.")
+    handles_by_dp_rank: dict[int, list[tuple[int, list[TeacherLogitsIPCHandle]]]] = {}
     for worker_result in worker_results:
-        dp_rank = worker_result["dp_rank"]
+        dp_rank = int(worker_result["dp_rank"])
+        if dp_rank < 0:
+            raise ValueError(
+                f"Teacher IPC dp_rank must be non-negative, got {dp_rank}."
+            )
         handles_by_dp_rank.setdefault(dp_rank, []).append(
-            worker_result["per_sample_handles"]
+            (worker_result["num_samples"], worker_result["per_sample_handles"])
         )
-    aggregated: list[dict[str, Any]] = []
-    for dp_rank in sorted(handles_by_dp_rank.keys()):
-        worker_handles_in_dp = handles_by_dp_rank[dp_rank]
-        num_samples = len(worker_handles_in_dp[0])
-        for worker_handles in worker_handles_in_dp:
-            assert len(worker_handles) == num_samples, (
-                f"dp={dp_rank}: per_sample_handles length mismatch "
-                f"{[len(h) for h in worker_handles_in_dp]}"
+    dp_ranks = sorted(handles_by_dp_rank)
+    if dp_ranks != list(range(dp_ranks[-1] + 1)):
+        raise ValueError(
+            "Teacher IPC worker results must cover contiguous DP ranks from zero, "
+            f"got {dp_ranks}."
+        )
+    aggregated: list[TeacherIPCPerSample] = []
+    for dp_rank in dp_ranks:
+        worker_results_in_dp = handles_by_dp_rank[dp_rank]
+        sample_counts = {item[0] for item in worker_results_in_dp}
+        if len(sample_counts) != 1:
+            raise ValueError(
+                f"dp={dp_rank}: workers disagree on local sample count: "
+                f"{sorted(sample_counts)}."
             )
+        num_samples = sample_counts.pop()
+        if num_samples < 0:
+            raise ValueError(f"dp={dp_rank}: num_samples must be non-negative.")
+        contributor_handles: list[list[TeacherLogitsIPCHandle]] = []
+        for _, worker_handles in worker_results_in_dp:
+            if len(worker_handles) not in {0, num_samples}:
+                raise ValueError(
+                    f"dp={dp_rank}: a worker emitted {len(worker_handles)} handles "
+                    f"for {num_samples} samples; expected zero or one per sample."
+                )
+            if worker_handles:
+                contributor_handles.append(worker_handles)
+        if num_samples > 0 and not contributor_handles:
+            raise ValueError(f"dp={dp_rank}: no worker contributed teacher logits.")
         for sample_idx in range(num_samples):
-            aggregated.append(
-                {
-                    "teacher_shards": [
-                        worker_handles[sample_idx]
-                        for worker_handles in worker_handles_in_dp
-                    ]
-                }
+            teacher_shards = sorted(
+                (handles[sample_idx] for handles in contributor_handles),
+                key=lambda shard: (
+                    int(shard["global_seq_start"]),
+                    int(shard["vocab_start_index"]),
+                    int(shard["world_rank"]),
+                ),
             )
+            _validate_teacher_shard_coverage(
+                teacher_shards, dp_rank=dp_rank, sample_idx=sample_idx
+            )
+            aggregated.append({"teacher_shards": teacher_shards})
     return aggregated
 
 

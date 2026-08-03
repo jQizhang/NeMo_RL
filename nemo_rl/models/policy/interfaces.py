@@ -48,6 +48,43 @@ class TopkLogitsOutputSpec(TypedDict):
     topk_indices: torch.Tensor
 
 
+class TeacherLogitsIPCHandle(TypedDict):
+    """One producer rank's rectangular teacher-logits IPC shard."""
+
+    payload_ipc: tuple[Any, ...]
+    buf_idx: int
+    sample_index_in_buf: int
+    storage_shape: tuple[int, ...]
+    actual_shape: tuple[int, int]
+    dtype: torch.dtype
+    tp_rank: int
+    cp_rank: int
+    tp_size: int
+    cp_size: int
+    world_rank: int
+    vocab_start_index: int
+    vocab_end_index: int
+    global_seq_start: int
+    full_vocab_size: int
+    full_seq_len: int
+    vocab_sharded: bool
+    sequence_sharded: bool
+
+
+class TeacherIPCWorkerResult(TypedDict):
+    """Teacher IPC metadata returned by one distributed worker."""
+
+    per_sample_handles: list[TeacherLogitsIPCHandle]
+    dp_rank: int
+    num_samples: int
+
+
+class TeacherIPCPerSample(TypedDict):
+    """All producer shards required to reconstruct one teacher sample."""
+
+    teacher_shards: list[TeacherLogitsIPCHandle]
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 

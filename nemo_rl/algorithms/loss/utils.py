@@ -22,9 +22,6 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
-from nemo_rl.algorithms.x_token.loss_utils import (
-    prepare_xtoken_cross_tokenizer_loss_input,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
@@ -32,6 +29,98 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
+
+
+def needs_unfiltered_reference_logprobs(
+    loss_fn: LossFunction,
+    sampling_params: Optional[TrainingSamplingParams],
+) -> bool:
+    """Return whether filtered policy training also needs raw logprobs."""
+    return bool(
+        need_top_k_or_top_p_filtering(sampling_params)
+        and getattr(loss_fn, "reference_policy_kl_penalty", 0) != 0
+    )
+
+
+def prepare_precomputed_logprob_loss_input(
+    logprobs: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    *,
+    sampling_params: Optional[TrainingSamplingParams],
+    unfiltered_logprobs: Optional[torch.Tensor] = None,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Apply policy-loss semantics to precomputed next-token logprobs."""
+    if loss_fn.input_type != LossInputType.LOGPROB:
+        raise ValueError(
+            "prepare_precomputed_logprob_loss_input requires LOGPROB, got "
+            f"{loss_fn.input_type}."
+        )
+    if logprobs.ndim != 2:
+        raise ValueError(
+            f"Precomputed logprobs must have shape [B, S-1], got {logprobs.shape}."
+        )
+    expected_shape = (data["input_ids"].shape[0], data["input_ids"].shape[1] - 1)
+    if tuple(logprobs.shape) != expected_shape:
+        raise ValueError(
+            "Precomputed logprobs do not match the canonical input IDs: "
+            f"expected {expected_shape}, got {tuple(logprobs.shape)}."
+        )
+
+    if need_top_k_or_top_p_filtering(sampling_params):
+        mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        logprobs = mask_out_neg_inf_logprobs(
+            logprobs, mask[:, 1:].to(logprobs.device), "curr_logprobs"
+        )
+
+    if needs_unfiltered_reference_logprobs(loss_fn, sampling_params):
+        if unfiltered_logprobs is None:
+            raise ValueError(
+                "Reference-policy KL with filtered sampling requires unfiltered "
+                "current-policy logprobs."
+            )
+        if unfiltered_logprobs.shape != logprobs.shape:
+            raise ValueError(
+                "Filtered and unfiltered current logprobs must have the same shape, "
+                f"got {logprobs.shape} and {unfiltered_logprobs.shape}."
+            )
+        data["curr_logprobs_unfiltered"] = unfiltered_logprobs
+
+    return {"next_token_logprobs": logprobs}, data
+
+
+def prepare_precomputed_distillation_loss_input(
+    student_topk_logprobs: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    H_all: Optional[torch.Tensor],
+) -> dict[str, Optional[torch.Tensor]]:
+    """Finalize globally restored standard-distillation loss inputs."""
+    if student_topk_logprobs.ndim != 3 or teacher_topk_logits.ndim != 3:
+        raise ValueError(
+            "Student logprobs and teacher logits must have shape [B, S, K], got "
+            f"{student_topk_logprobs.shape} and {teacher_topk_logits.shape}."
+        )
+    if student_topk_logprobs.shape != teacher_topk_logits.shape:
+        raise ValueError(
+            "Student and teacher distillation tensors must have identical global "
+            f"shapes, got {student_topk_logprobs.shape} and {teacher_topk_logits.shape}."
+        )
+    if H_all is not None and H_all.shape != student_topk_logprobs.shape[:2]:
+        raise ValueError(
+            "H_all must match the global [B, S] prefix, got "
+            f"H_all={H_all.shape}, student={student_topk_logprobs.shape}."
+        )
+
+    teacher_topk_logits = teacher_topk_logits.to(
+        student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+    )
+    teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
+    result: dict[str, Optional[torch.Tensor]] = {
+        "student_topk_logprobs": student_topk_logprobs[:, :-1, :],
+        "teacher_topk_logprobs": teacher_topk_logprobs[:, :-1, :],
+        "H_all": None if H_all is None else H_all[:, :-1],
+    }
+    return result
 
 
 def prepare_loss_input(
@@ -93,31 +182,34 @@ def prepare_loss_input(
                 chunk_size=chunk_size,
             )
 
-        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if need_top_k_or_top_p_filtering(sampling_params):
-            # mask out negative infinity logprobs
-            # prev_logprobs is already masked out in the previous step
-            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
-
-            # compute unfiltered logprobs for reference policy KL penalty
+        unfiltered_logprobs = None
+        if needs_unfiltered_reference_logprobs(loss_fn, sampling_params):
             if (
-                hasattr(loss_fn, "reference_policy_kl_penalty")
-                and loss_fn.reference_policy_kl_penalty != 0
+                hasattr(loss_fn, "use_fused_linear_logprobs")
+                and loss_fn.use_fused_linear_logprobs
             ):
-                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
-                    input_ids=data["input_ids"],
-                    next_token_logits=logits,
-                    seq_index=data.get("seq_index", None),
-                    vocab_parallel_rank=vocab_parallel_rank,
-                    vocab_parallel_group=vocab_parallel_group,
-                    context_parallel_group=context_parallel_group,
-                    sampling_params=None,  # no filtering
-                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
-                    chunk_size=None,
+                raise ValueError(
+                    "Fused linear logprobs cannot provide the unfiltered values "
+                    "required by reference-policy KL with filtered sampling."
                 )
-
-        loss_input = {"next_token_logprobs": logprobs}
+            unfiltered_logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=None,  # no filtering
+                # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
+                chunk_size=None,
+            )
+        return prepare_precomputed_logprob_loss_input(
+            logprobs,
+            data,
+            loss_fn,
+            sampling_params=sampling_params,
+            unfiltered_logprobs=unfiltered_logprobs,
+        )
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
@@ -138,34 +230,6 @@ def prepare_loss_input(
             "student_topk_logprobs": student_topk_logprobs,
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
-        }
-    elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
-        # handles and do the shared CP-resolution the loss needs; the loss fn
-        # does the per-teacher projection / chunk-average / KL reductions and
-        # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
-        # the teacher count and which teachers are same-tokenizer (``None``). The
-        # TP/CP groups are derived from the student logits' own device mesh.
-        (
-            student_logits_contig,
-            teacher_full_logits_by_idx,
-            aligns_by_idx,
-            tp_group,
-            cp_group,
-        ) = prepare_xtoken_cross_tokenizer_loss_input(
-            logits,
-            data,
-            projection_matrix_paths=loss_fn.projection_matrix_paths,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
-        )
-        loss_input = {
-            "logits": logits,
-            "student_logits_contig": student_logits_contig,
-            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
-            "aligns_by_idx": aligns_by_idx,
-            "tp_group": tp_group,
-            "cp_group": cp_group,
         }
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
