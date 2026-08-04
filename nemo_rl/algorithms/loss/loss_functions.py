@@ -35,6 +35,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     select_teacher_topk_indices,
     student_next_token_ce,
     valid_chunk_mask,
+    windowed_next_token_ce,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -1631,7 +1632,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
         the raw ``logits`` is kept for the CE term.
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_logits_contig=student_logits_contig,
+            align=aligns_by_idx[0],
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -2629,11 +2638,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_logits_contig: torch.Tensor,
+        align: LocalizedAlignment,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
-        """Next-token CE on the student side (TP/CP handled by the helpers)."""
-        per_token_ce = student_next_token_ce(
-            logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
-        )
+        """Next-token CE on the student side (TP/CP handled by the helpers).
+
+        Under CP the CE runs on the same contiguous window as the KD terms, so
+        both are partitioned and share one backward scale. Without CP the window
+        is the whole sequence and this reduces to the plain masked mean.
+        """
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+            return windowed_next_token_ce(
+                student_logits_contig,
+                input_ids=align.student_input_ids,
+                token_mask=align.student_token_mask,
+                sample_mask=data["sample_mask"],
+                global_valid_toks=global_valid_toks,
+                tp_group=tp_group,
+                cp_group=cp_group,
+            )
+        per_token_ce = student_next_token_ce(logits, input_ids=data["input_ids"])
         label_mask = ce_label_mask(
             token_mask=data["token_mask"],
             sample_mask=data["sample_mask"],

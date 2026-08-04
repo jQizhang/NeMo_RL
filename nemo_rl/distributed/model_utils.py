@@ -830,7 +830,7 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
-def _tp_target_logprobs(
+def tp_target_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
     *,
@@ -927,6 +927,71 @@ def _tp_target_logprobs(
     ).contiguous()
 
 
+def cp_contiguous_window(
+    x: torch.Tensor,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Slice a canonical full-sequence tensor to this CP rank's contiguous window.
+
+    The cross-tokenizer distillation path works in contiguous windows
+    ``[r * S/cp, (r+1) * S/cp)`` rather than the canonical full sequence, because
+    the teacher's full-vocab logits are shipped over CUDA IPC as contiguous
+    slices routed by ``global_seq_start``. Pure slicing: no collective.
+
+    Args:
+        x: Canonical ``[..., S, ...]`` tensor.
+        cp_size: Context-parallel world size.
+        cp_rank: This rank's index in the CP group.
+        seq_dim: Sequence axis of ``x``.
+
+    Returns:
+        ``[..., S/cp_size, ...]`` view of this rank's window.
+    """
+    if cp_size <= 1:
+        return x
+    seq_len = x.shape[seq_dim]
+    if seq_len % cp_size != 0:
+        raise ValueError(
+            f"Contiguous CP windows require a sequence length divisible by cp_size, "
+            f"got seq_len={seq_len} on dim {seq_dim} with cp_size={cp_size}."
+        )
+    local_len = seq_len // cp_size
+    return x.narrow(seq_dim, cp_rank * local_len, local_len)
+
+
+def cp_local_to_contiguous_window(
+    x: torch.Tensor | DTensor,
+    cp_sharder: Any,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Re-lay a CP-local shard into this rank's contiguous window.
+
+    Differentiable: :meth:`ContextParallelSharder.gather_token_tensor` restores
+    canonical order (and trims Automodel's CP padding), then the window is
+    sliced out. This is the sharder-based replacement for
+    :func:`cp_load_balanced_to_contiguous`, which hard-coded the ``2*cp``
+    load-balanced layout.
+
+    A tensor-parallel ``DTensor`` is unwrapped to its local vocabulary shard —
+    the caller handles TP separately via ``tp_group``. Without CP the input is
+    returned untouched (matching :func:`cp_load_balanced_to_contiguous`, whose
+    consumers still expect a ``DTensor`` on the non-CP path).
+    """
+    if cp_size <= 1:
+        return x
+    local = x.to_local() if isinstance(x, DTensor) else x
+    full = cp_sharder.gather_token_tensor(local, seq_dim=seq_dim, trim=True)
+    return cp_contiguous_window(
+        full, cp_size=cp_size, cp_rank=cp_rank, seq_dim=seq_dim
+    ).contiguous()
+
+
 def get_cp_sharded_next_token_logprobs(
     logits: torch.Tensor | DTensor,
     input_ids: torch.Tensor,
@@ -973,7 +1038,7 @@ def get_cp_sharded_next_token_logprobs(
     global_targets = input_ids.roll(shifts=-1, dims=1)
     local_targets = cp_sharder.shard_token_tensor(global_targets, seq_dim=1, fill=0)
 
-    local_logprobs = _tp_target_logprobs(
+    local_logprobs = tp_target_logprobs(
         local_logits,
         local_targets,
         vocab_start_index=vocab_start_index,
@@ -1046,7 +1111,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     else:
         target = target.roll(shifts=-1, dims=-1)
 
-    logprobs = _tp_target_logprobs(
+    logprobs = tp_target_logprobs(
         vocab_parallel_logits,
         target,
         vocab_start_index=vocab_start_index,
@@ -1866,6 +1931,7 @@ def gather_logits_at_global_indices(
     vocab_start_index: int,
     vocab_end_index: int,
     chunk_size: Optional[int] = None,
+    cp_sharder: Optional[Any] = None,
 ) -> torch.Tensor:
     """Gather student logits at given global token indices under TP+CP sharding.
 
@@ -1878,7 +1944,10 @@ def gather_logits_at_global_indices(
         vocab_start_index: global vocab start for this rank (inclusive)
         vocab_end_index: global vocab end for this rank (exclusive)
         chunk_size: optional chunk along sequence dim to bound memory
-        cp_group: Optional context-parallel process group
+        cp_group: Optional context-parallel process group (V1 DTensor / Megatron
+            workers, which own their CP layout).
+        cp_sharder: Automodel ``ContextParallelSharder`` owning the layout (V2
+            automodel worker). Takes precedence over ``cp_group``.
 
     Returns:
         gathered_logits: [B, S_full, k]
@@ -1888,7 +1957,13 @@ def gather_logits_at_global_indices(
 
     # Handle CP sharding of global_indices (similar to from_parallel_logits_to_logprobs)
     pad_len = 0
-    if cp_size > 1:
+    if cp_sharder is not None:
+        # Automodel owns the layout: map the canonical indices into the same
+        # local token order the logits were produced in.
+        global_indices = cp_sharder.shard_token_tensor(
+            global_indices, seq_dim=1, fill=0
+        )
+    elif cp_size > 1:
         # Pad the global_indices to local size * cp_size if needed
         pad_len = vocab_parallel_logits.shape[1] * cp_size - global_indices.shape[1]
         if pad_len > 0:
@@ -1932,7 +2007,11 @@ def gather_logits_at_global_indices(
     )
 
     # CP gather: gather the logits by context parallelism
-    if cp_size > 1:
+    if cp_sharder is not None:
+        gathered_logits = cp_sharder.gather_token_tensor(
+            gathered_logits, seq_dim=1, trim=True
+        )
+    elif cp_size > 1:
         gathered_logits = allgather_cp_sharded_tensor(
             gathered_logits, cp_group, seq_dim=1
         )
@@ -1953,8 +2032,16 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_sharder: Optional[Any] = None,
 ):
-    """Compute top-k log probabilities from logits."""
+    """Compute top-k log probabilities from logits.
+
+    ``cp_sharder`` (V2 automodel worker) makes Automodel's ``ShardLayout`` the
+    owner of the sequence layout: the canonical ``teacher_topk_indices`` are
+    mapped into the model's local token order, the top-k logprobs are computed
+    there, and the result is gathered back to canonical order. ``context_parallel_group``
+    is the V1 / Megatron path, which derives the layout itself.
+    """
     if teacher_topk_indices.shape[-1] <= 0:
         raise ValueError(
             f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
@@ -1994,16 +2081,19 @@ def get_distillation_topk_logprobs_from_logits(
         vocab_start_index = tp_rank * V_local
         vocab_end_index = (tp_rank + 1) * V_local
 
-        # For DTensor, derive CP group/size from the device mesh to ensure CP-aware alignment
-        if (
-            device_mesh.mesh_dim_names is not None
-            and "cp" in device_mesh.mesh_dim_names
-        ):
-            cp_group = device_mesh.get_group("cp")
-            cp_size = cp_group.size()
-        else:
-            cp_group = None
-            cp_size = 1
+        # For DTensor, derive CP group/size from the device mesh to ensure
+        # CP-aware alignment. With ``cp_sharder`` the layout is Automodel's and
+        # the mesh carries no "cp" axis, so leave the caller's group alone.
+        if cp_sharder is None:
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+                cp_size = cp_group.size()
+            else:
+                cp_group = None
+                cp_size = 1
 
     else:
         student_logits = student_logits
@@ -2017,7 +2107,11 @@ def get_distillation_topk_logprobs_from_logits(
             indices_local = teacher_topk_indices
             pad_len = 0
 
-            if cp_size > 1:
+            if cp_sharder is not None:
+                indices_local = cp_sharder.shard_token_tensor(
+                    indices_local, seq_dim=1, fill=0
+                )
+            elif cp_size > 1:
                 pad_len = student_logits.shape[1] * cp_size - indices_local.shape[1]
                 if pad_len > 0:
                     indices_local = torch.nn.functional.pad(
@@ -2048,7 +2142,13 @@ def get_distillation_topk_logprobs_from_logits(
                     False,
                 )
 
-            if cp_size > 1:
+            if cp_sharder is not None:
+                student_topk_logprobs = cp_sharder.gather_token_tensor(
+                    student_topk_logprobs, seq_dim=1, trim=True
+                )
+                if calculate_entropy:
+                    H_all = cp_sharder.gather_token_tensor(H_all, seq_dim=1, trim=True)
+            elif cp_size > 1:
                 student_topk_logprobs = allgather_cp_sharded_tensor(
                     student_topk_logprobs, cp_group, seq_dim=1
                 )
@@ -2059,19 +2159,32 @@ def get_distillation_topk_logprobs_from_logits(
                     if calculate_entropy:
                         H_all = H_all[:, :-pad_len]
 
-        # Non-distributed processing
+        # Non-distributed processing (no TP). Still CP-aware: the logits are this
+        # rank's local shard, so the canonical teacher indices are mapped into
+        # the same layout and the result is gathered back.
         else:
+            indices_local = teacher_topk_indices
+            if cp_sharder is not None:
+                indices_local = cp_sharder.shard_token_tensor(
+                    indices_local, seq_dim=1, fill=0
+                )
+
             student_logprobs = torch.nn.functional.log_softmax(student_logits, dim=-1)
-            student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices
-            )
+            student_topk_logprobs = student_logprobs.gather(dim=-1, index=indices_local)
 
             if calculate_entropy:
                 H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
 
+            if cp_sharder is not None:
+                student_topk_logprobs = cp_sharder.gather_token_tensor(
+                    student_topk_logprobs, seq_dim=1, trim=True
+                )
+                if calculate_entropy:
+                    H_all = cp_sharder.gather_token_tensor(H_all, seq_dim=1, trim=True)
+
     else:
         # Distributed processing
-        if parallel_group is not None or cp_size > 1:
+        if parallel_group is not None or cp_size > 1 or cp_sharder is not None:
             if parallel_group is None:
                 vocab_start_index = 0
                 vocab_end_index = int(student_logits.shape[-1])
@@ -2083,6 +2196,7 @@ def get_distillation_topk_logprobs_from_logits(
                 cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
+                cp_sharder=cp_sharder,
             )
 
         # Non-distributed processing

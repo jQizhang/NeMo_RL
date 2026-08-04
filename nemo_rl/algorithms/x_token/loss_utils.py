@@ -46,10 +46,13 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
+    cp_contiguous_window,
     cp_load_balanced_to_contiguous,
+    cp_local_to_contiguous_window,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
+    tp_target_logprobs,
     vocab_parallel_argmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
@@ -374,6 +377,80 @@ def ce_label_mask(
     )
     sample_mask = to_local_if_dtensor(sample_mask)
     return (token_mask[:, 1 : ce_seq_len + 1] * sample_mask.unsqueeze(-1)).to(dtype)
+
+
+def windowed_next_token_ce(
+    student_logits_contig: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Student next-token CE computed on this rank's contiguous CP window.
+
+    Partitioned by construction, matching the KD terms: each rank sums the masked
+    CE over its own window and the numerator is combined with a *differentiable*
+    SUM all-reduce. That keeps three properties at once:
+
+    - the value equals the full-sequence ``masked_mean`` (``global_valid_toks``
+      is already the DP-global token count, so summing per-window numerators over
+      a global denominator is the same quantity);
+    - the value is identical on every CP rank, so the reported ``ce_loss`` metric
+      is not a ``1/cp`` fragment;
+    - the gradient fanout stays 1 (``group_all_reduce_sum_with_grad`` has an
+      identity backward), so it composes with the KD terms under a single
+      backward scale.
+
+    A replicated formulation (canonical-order logprobs via a gathering collective)
+    would have fanout ``cp`` and could not share a backward scale with the KD
+    terms.
+
+    Args:
+        student_logits_contig: ``[B, S/cp, V_s(/TP)]`` window logits.
+        input_ids: ``[B, S/cp]`` window token ids (unshifted).
+        token_mask: ``[B, S/cp]`` window token mask (unshifted).
+        sample_mask: ``[B]`` per-sample mask.
+        global_valid_toks: DP-global valid next-token count.
+        tp_group: Vocabulary-parallel group, or None for a full local vocabulary.
+        cp_group: Context-parallel group.
+
+    Returns:
+        Scalar CE, identical on every CP rank.
+    """
+    # CP-aware next-token shift: this rank's last position takes the next rank's
+    # first token, so window boundaries pair predictors with the right labels.
+    next_ids = cp_shift_next(to_local_if_dtensor(input_ids), cp_group, fill=0)
+    next_mask = cp_shift_next(to_local_if_dtensor(token_mask), cp_group, fill=0)
+
+    local_logits = to_local_if_dtensor(student_logits_contig)
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        vocab_per_rank = int(local_logits.shape[-1])
+        tp_rank = torch.distributed.get_rank(tp_group)
+        vocab_start_index = tp_rank * vocab_per_rank
+        vocab_end_index = (tp_rank + 1) * vocab_per_rank
+    else:
+        tp_group = None
+        vocab_start_index = 0
+        vocab_end_index = int(local_logits.shape[-1])
+
+    per_token_logprobs = tp_target_logprobs(
+        local_logits,
+        next_ids.to(torch.long),
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        tp_group=tp_group,
+        inference_only=not torch.is_grad_enabled(),
+    )
+    mask = (next_mask * to_local_if_dtensor(sample_mask).unsqueeze(-1)).to(
+        per_token_logprobs.dtype
+    )
+    numerator = group_all_reduce_sum_with_grad(
+        (-per_token_logprobs * mask).sum(), cp_group
+    )
+    return numerator / (global_valid_toks + 1e-8)
 
 
 def next_token_accuracy(
@@ -976,6 +1053,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_sharder: Optional[Any] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
@@ -993,13 +1071,17 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     localized, next-token-shifted chunk alignment from its ``alignment_{i}_*``
     keys; a same-tokenizer teacher (``None`` path) gets a thin alignment carrying
     only the shared student fields (identity 1:1 token alignment, no chunks).
-    TP/CP groups come from the student ``logits``' device mesh, falling back to
-    the passed groups for non-DTensor logits.
+    The TP group comes from the student ``logits``' device mesh, falling back to
+    ``vocab_parallel_group``. The CP group is always an explicit argument: with
+    Automodel-owned CP the logits carry no ``cp`` mesh axis to read it from.
 
     Args:
         projection_matrix_paths: Per-teacher projection paths. Its length is the
             teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
             keys read here; a ``None`` entry marks a same-tokenizer teacher.
+        cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
+            layout (V2 automodel worker). When set, ``logits`` is this rank's CP
+            local shard while every ``data`` field is canonical full-sequence.
 
     Returns:
         ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
@@ -1007,25 +1089,49 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
         mesh_names = mesh.mesh_dim_names or ()
-        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
-        tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
+        cp_group = (
+            mesh.get_group("cp") if "cp" in mesh_names else context_parallel_group
+        )
+        tp_group = mesh.get_group("tp") if "tp" in mesh_names else vocab_parallel_group
     else:
         cp_group = context_parallel_group
         tp_group = vocab_parallel_group
 
     device = torch.cuda.current_device()
+    cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    cp_rank = torch.distributed.get_rank(cp_group) if cp_size > 1 else 0
 
-    # Student CP-relay computed once and shared by every teacher's KD term and
-    # the next-token-accuracy metric. Relaid from CP load-balanced to this rank's
-    # contiguous window; input_ids / token_mask stay unshifted (the accuracy
-    # metric and the same-vocab KD apply their own CP-aware next-token shift).
-    student_logits_contig = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
-    student_input_ids = cp_load_balanced_to_contiguous(
-        data["input_ids"], cp_group=cp_group
-    )
-    student_token_mask = cp_load_balanced_to_contiguous(
-        data["token_mask"], cp_group=cp_group
-    )
+    # Student relay to this rank's contiguous window, computed once and shared by
+    # every teacher's KD term and the next-token-accuracy metric. The window (not
+    # the canonical sequence) is the working coordinate system because the teacher's
+    # full-vocab logits arrive over CUDA IPC as contiguous slices routed by
+    # ``global_seq_start``. ``input_ids`` / ``token_mask`` stay unshifted here (the
+    # accuracy metric, the CE term and the same-vocab KD apply their own CP-aware
+    # next-token shift).
+    #
+    # Only ``logits`` is a CP-local shard and needs a collective; with
+    # Automodel-owned CP the data-dict fields are canonical, so their window is a
+    # plain slice.
+    if cp_sharder is not None:
+        student_logits_contig = cp_local_to_contiguous_window(
+            logits, cp_sharder, cp_size=cp_size, cp_rank=cp_rank
+        )
+        student_input_ids = cp_contiguous_window(
+            data["input_ids"], cp_size=cp_size, cp_rank=cp_rank
+        )
+        student_token_mask = cp_contiguous_window(
+            data["token_mask"], cp_size=cp_size, cp_rank=cp_rank
+        )
+    else:
+        student_logits_contig = cp_load_balanced_to_contiguous(
+            logits, cp_group=cp_group
+        )
+        student_input_ids = cp_load_balanced_to_contiguous(
+            data["input_ids"], cp_group=cp_group
+        )
+        student_token_mask = cp_load_balanced_to_contiguous(
+            data["token_mask"], cp_group=cp_group
+        )
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
@@ -1052,8 +1158,17 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             alignment_prefix=f"alignment_{i}_",
             cp_group=cp_group,
         )
+        student_chunk_id_window = (
+            cp_contiguous_window(
+                align.student_chunk_id, cp_size=cp_size, cp_rank=cp_rank
+            )
+            if cp_sharder is not None
+            else cp_load_balanced_to_contiguous(
+                align.student_chunk_id, cp_group=cp_group
+            )
+        )
         align.student_chunk_id = cp_shift_next(
-            cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
+            student_chunk_id_window,
             cp_group,
             fill=-1,
         )

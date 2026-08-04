@@ -137,6 +137,7 @@ def prepare_loss_input(
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
             )
         )
 
@@ -164,6 +165,7 @@ def prepare_loss_input(
             projection_matrix_paths=loss_fn.projection_matrix_paths,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            cp_sharder=cp_sharder,
         )
         loss_input = {
             "logits": logits,
