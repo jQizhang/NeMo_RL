@@ -58,6 +58,10 @@ class ProcessedInputs:
     # ``position_ids`` with the padded, CP-sharded model-batch tensors.
     cp_sharder: Optional[Any] = None
 
+    # Everything the sharder left in the model batch (``labels`` removed), passed
+    # to the model forward verbatim. Empty when CP is inactive.
+    cp_model_kwargs: dict[str, Any] = field(default_factory=dict)
+
     @property
     def has_context_parallel(self) -> bool:
         """Check if context parallel is enabled."""

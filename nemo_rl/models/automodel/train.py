@@ -127,6 +127,16 @@ def model_forward(
     if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
+    # Everything Automodel's CP sharder put in the model batch goes to the
+    # forward verbatim, overriding our defaults. A model that owns its CP
+    # sharding adds the inputs its attention needs here, so dropping them would
+    # silently run it with the wrong context-parallel inputs.
+    if processed_inputs.cp_model_kwargs:
+        model_args.update(processed_inputs.cp_model_kwargs)
+        if "inputs_embeds" in model_args:
+            # HF forwards reject both; the sharder-provided embeddings win.
+            model_args.pop("input_ids", None)
+
     outputs = model(**model_args)
     return outputs
 
@@ -191,28 +201,24 @@ def apply_top_k_top_p_filtering_for_local_logits(
     return logits
 
 
-# Student-sequence-aligned cross-tokenizer fields. Teacher-sequence fields (T_t
-# may differ from T_s) stay full length; the loss slices them contiguously by
-# student CP rank because the IPC consumer ships contiguous teacher slices (see
-# FullLogitsPostProcessor below). Single-teacher runs use the unprefixed
-# ``alignment_student_*`` keys, multi-teacher uses ``alignment_{i}_student_*``;
-# the suffix match captures both and excludes ``*_teacher_*``.
-_STUDENT_SEQ_ALIGNMENT_SUFFIXES = (
-    "_student_chunk_id",
-    "_student_exact_partition_mask",
-)
+# Loss input types whose CP contract is *partitioned*: every CP rank computes a
+# piece of the loss and the pieces are combined by differentiable SUM reductions
+# with identity backward (``group_all_reduce_sum_with_grad``). Their gradient
+# fanout is 1. Everything else is *replicated* — each rank holds the same
+# full-sequence loss, produced by a gathering collective whose backward sums
+# across ranks, so the fanout is ``cp_size``.
+_CP_PARTITIONED_INPUT_TYPES = frozenset({LossInputType.DISTILLATION_CROSS_TOKENIZER})
 
 
-def _student_seq_aligned_keys(data_dict: BatchedDataDict[Any]) -> list[str]:
-    """Keys of ``data_dict`` that must be CP-sharded alongside the student logits."""
-    keys = [
-        k
-        for k in data_dict
-        if k.startswith("alignment_") and k.endswith(_STUDENT_SEQ_ALIGNMENT_SUFFIXES)
-    ]
-    if keys and "token_mask" in data_dict:
-        keys.append("token_mask")
-    return keys
+def cp_gradient_fanout(loss_fn: LossFunction, cp_size: int) -> int:
+    """How many times a CP group's ranks each backward the same loss quantity.
+
+    See :data:`_CP_PARTITIONED_INPUT_TYPES`. Used to cancel the extra factor a
+    replicated loss picks up from its gathering collective's summing backward.
+    """
+    if cp_size <= 1:
+        return 1
+    return 1 if loss_fn.input_type in _CP_PARTITIONED_INPUT_TYPES else cp_size
 
 
 def _cp_gather_logits(
@@ -260,8 +266,9 @@ def prepare_cp_forward(
         model: The live (parallelized) model; its CP hook and attention backend
             select the sharding strategy.
         device_mesh: The full device mesh; Automodel reads its ``cp``/``tp`` axes.
-        processed_inputs: Microbatch inputs. ``input_ids``, ``position_ids`` and
-            ``cp_sharder`` are replaced in place with the sharded model batch.
+        processed_inputs: Microbatch inputs. ``input_ids``, ``position_ids``,
+            ``cp_model_kwargs`` and ``cp_sharder`` are replaced in place with the
+            sharded model batch.
         padding_token_id: Pad sentinel for ``input_ids``.
 
     Returns:
@@ -285,18 +292,27 @@ def prepare_cp_forward(
     )
     model_context_factory, model_batch = cp_sharder.shard(model_batch)
 
-    if "inputs_embeds" in model_batch:
-        raise NotImplementedError(
-            "Context-parallel sharders that hand back pre-embedded inputs are not "
-            "supported by the automodel policy worker yet; the forward only "
-            "consumes input_ids."
-        )
+    # Pass the whole sharded batch to the forward, minus ``labels`` (which would
+    # make the model compute its own LM loss). A model-owned CP hook
+    # (``prepare_model_inputs_for_cp`` on DSV4 / Gemma4 / Qwen3.5 / GLM-MoE-DSA /
+    # Kimi-K3 / ...) merges the extra inputs its attention needs into this batch —
+    # mRoPE ``position_ids``, ``padding_mask``, vision group ids, packed-sequence
+    # metadata. Rebuilding the kwargs from a fixed field list instead would drop
+    # them and silently run those models with the wrong CP inputs. This mirrors
+    # Automodel's own recipes, which do ``batch.pop("labels")`` then
+    # ``model(**batch)``.
+    model_batch.pop("labels", None)
 
     # Read the (possibly padded) tensors back before entering the context: the
     # actual in-place shard happens on context entry, and the forward must see
     # the same objects the CP context registered.
-    processed_inputs.input_ids = model_batch["input_ids"]
-    processed_inputs.position_ids = model_batch["position_ids"]
+    processed_inputs.input_ids = model_batch.get(
+        "input_ids", processed_inputs.input_ids
+    )
+    processed_inputs.position_ids = model_batch.get(
+        "position_ids", processed_inputs.position_ids
+    )
+    processed_inputs.cp_model_kwargs = model_batch
     processed_inputs.cp_sharder = cp_sharder
     return model_context_factory
 
@@ -555,21 +571,21 @@ def automodel_forward_backward(
                     ## by zero in the loss function to prevent them
                     ## from affecting the gradient calculation
 
-                    # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                    # but we want to sum them so we cancel out the average here.
+                    # FSDP averages gradients over the dp_cp mesh; multiplying by
+                    # dp_size * cp_size cancels that average back to a sum.
                     #
-                    # The CP factor is deliberately not applied when CP is active:
-                    # every CP rank holds the same replicated full-sequence loss,
-                    # and the differentiable gather that produced it
+                    # Dividing by the fanout then removes the extra factor a
+                    # *replicated* loss picks up: every CP rank backwards the same
+                    # full-sequence loss, and the gather that produced it
                     # (ContextParallelSharder.gather_token_tensor ->
-                    # torch.distributed.nn.functional.all_gather, whose backward is
-                    # a summing reduce_scatter) has already fanned those cp_size
-                    # identical loss consumers into each local shard's gradient.
-                    # Multiplying by cp_size again would scale CP gradients by
-                    # cp_size relative to the cp_size == 1 result.
-                    loss = (
-                        result * dp_size if cp_size > 1 else result * dp_size * cp_size
-                    )
+                    # torch.distributed.nn.functional.all_gather) has a summing
+                    # reduce_scatter backward, so the cp_size identical consumers
+                    # already fanned into each local shard's gradient. A
+                    # *partitioned* loss (cross-tokenizer distillation) combines
+                    # its per-rank pieces with identity-backward SUM reductions
+                    # instead, so its fanout is 1 and the cp_size factor stands.
+                    fanout = cp_gradient_fanout(post_processing_fn.loss_fn, cp_size)
+                    loss = result * dp_size * cp_size / fanout
                     loss.backward()
 
         results.append((result, metrics))
@@ -642,33 +658,30 @@ class LossPostProcessor:
         cp_sharder = processed_inputs.cp_sharder if self.cp_size > 1 else None
         if cp_sharder is not None:
             input_type = self.loss_fn.input_type
-            if input_type == LossInputType.LOGPROB:
-                # Cross-tokenizer student-sequence fields used to ride the CP
-                # buffer list, so map them through the very same layout here.
-                for key in _student_seq_aligned_keys(data_dict):
-                    data_dict[key] = cp_sharder.shard_token_tensor(
-                        data_dict[key], seq_dim=sequence_dim, fill=0
-                    )
-            elif input_type == LossInputType.LOGIT:
+            if input_type == LossInputType.LOGIT:
                 # Logit losses (value-head MSE, DPO) consume full-sequence logits
                 # against the canonical data_dict, so restore canonical order here
                 # while keeping any vocabulary (TP) sharding intact.
                 logits = _cp_gather_logits(logits, cp_sharder, sequence_dim)
-            else:
+            elif input_type == LossInputType.DRAFT:
                 raise NotImplementedError(
-                    f"Loss input type {input_type} is not supported with "
-                    "context_parallel_size > 1 on the automodel policy worker. "
-                    "Its loss path still derives the CP layout itself (see "
-                    "nemo_rl/algorithms/x_token/loss_utils.py) instead of using "
-                    "Automodel's ContextParallelSharder; set "
-                    "dtensor_cfg.context_parallel_size=1 until it is migrated."
+                    "Draft (speculative-decoding) losses are not supported with "
+                    "context_parallel_size > 1 on the automodel policy worker: "
+                    "their next-token roll goes through megatron's CP-aware "
+                    "roll_tensor, which the automodel path never wires up. Set "
+                    "dtensor_cfg.context_parallel_size=1."
                 )
+            # LOGPROB / DISTILLATION / DISTILLATION_CROSS_TOKENIZER consume the
+            # CP-local logits directly and map through ``cp_sharder`` themselves.
 
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
             prepare_loss_input,
             sampling_params=self.sampling_params,
             cp_sharder=cp_sharder,
+            context_parallel_group=self.cp_mesh.get_group()
+            if cp_sharder is not None
+            else None,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
