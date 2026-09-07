@@ -720,8 +720,8 @@ class TestDTensorParamsGenerator:
         """Test that tensors are converted to target dtype."""
         # Arrange
         model = nn.Linear(10, 5)
-        # Initialize with float32
-        model = model.to(torch.float32)
+        # Initialize with a non-FP32 floating dtype.
+        model = model.to(torch.float16)
         target_dtype = torch.bfloat16
 
         # Act
@@ -733,23 +733,25 @@ class TestDTensorParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
-    def test_preserves_fp32_router_correction_bias(self):
-        """FP32 MoE router state must not be downcast during refit."""
+    def test_preserves_source_fp32_and_non_floating_dtypes(self):
+        """Refit must retain source FP32 and non-floating tensor dtypes."""
 
-        class RouterModel(nn.Module):
+        class MixedDtypeModel(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.register_buffer(
-                    "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+                    "source_fp32", torch.arange(4, dtype=torch.float32)
                 )
                 self.register_buffer(
-                    "ordinary_buffer", torch.arange(4, dtype=torch.float32)
+                    "source_fp16", torch.arange(4, dtype=torch.float16)
                 )
+                self.register_buffer("source_int64", torch.arange(4, dtype=torch.int64))
 
-        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+        results = dict(dtensor_params_generator(MixedDtypeModel(), torch.bfloat16))
 
-        assert results["e_score_correction_bias"].dtype == torch.float32
-        assert results["ordinary_buffer"].dtype == torch.bfloat16
+        assert results["source_fp32"].dtype == torch.float32
+        assert results["source_fp16"].dtype == torch.bfloat16
+        assert results["source_int64"].dtype == torch.int64
 
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
@@ -845,27 +847,25 @@ class TestDTensorParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_prepare_refit_info_preserves_fp32_router_correction_bias():
-    """Refit metadata must match the FP32 router-bias payload dtype."""
+def test_prepare_refit_info_preserves_source_fp32_and_non_floating_dtypes():
+    """Refit metadata must use the same mixed dtypes as its payload."""
 
-    class RouterModel(nn.Module):
+    class MixedDtypeModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.register_buffer(
-                "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "ordinary_buffer", torch.arange(4, dtype=torch.float32)
-            )
+            self.register_buffer("source_fp32", torch.arange(4, dtype=torch.float32))
+            self.register_buffer("source_fp16", torch.arange(4, dtype=torch.float16))
+            self.register_buffer("source_int64", torch.arange(4, dtype=torch.int64))
 
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
-    worker.model = RouterModel()
+    worker.model = MixedDtypeModel()
     worker.dtype = torch.bfloat16
 
     refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
 
-    assert refit_info["e_score_correction_bias"][1] == torch.float32
-    assert refit_info["ordinary_buffer"][1] == torch.bfloat16
+    assert refit_info["source_fp32"][1] == torch.float32
+    assert refit_info["source_fp16"][1] == torch.bfloat16
+    assert refit_info["source_int64"][1] == torch.int64
 
 
 @pytest.mark.automodel
