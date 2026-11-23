@@ -952,3 +952,76 @@ async def test_pinned_vllm_output_loops_match_the_patch() -> None:
     finally:
         socket.close(linger=0)
         context.term()
+
+
+class _FakeLogprobsProcessor:
+    @classmethod
+    def from_new_request(cls, tokenizer, request):
+        return SimpleNamespace(tokenizer=tokenizer, request=request)
+
+
+@pytest.fixture
+def fake_logprobs_module(monkeypatch):
+    """Stand-in for vllm.v1.engine.logprobs with a fresh LogprobsProcessor class."""
+    processor_cls = type("LogprobsProcessor", (_FakeLogprobsProcessor,), {})
+    module = types.ModuleType("vllm.v1.engine.logprobs")
+    module.LogprobsProcessor = processor_cls
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.logprobs", module)
+    return processor_cls
+
+
+def _request(extra_args):
+    return SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra_args))
+
+
+def test_skip_candidate_detokenize_drops_the_tokenizer_only_when_flagged(
+    fake_logprobs_module,
+):
+    patches.install_skip_logprobs_candidate_detokenize()
+    flag = patches.SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG
+
+    flagged = fake_logprobs_module.from_new_request(
+        tokenizer="tok", request=_request({flag: True})
+    )
+    assert flagged.tokenizer is None
+    for extra_args in (None, {}, {flag: False}, {"other": True}):
+        unflagged = fake_logprobs_module.from_new_request(
+            tokenizer="tok", request=_request(extra_args)
+        )
+        assert unflagged.tokenizer == "tok"
+
+
+def test_skip_candidate_detokenize_is_installed_once(fake_logprobs_module):
+    patches.install_skip_logprobs_candidate_detokenize()
+    patched = fake_logprobs_module.__dict__["from_new_request"]
+    patches.install_skip_logprobs_candidate_detokenize()
+
+    assert fake_logprobs_module.__dict__["from_new_request"] is patched
+
+
+def test_skip_candidate_detokenize_missing_vllm_internals_fail_loudly(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.logprobs",
+        types.ModuleType("vllm.v1.engine.logprobs"),
+    )
+    with pytest.raises(RuntimeError, match="skip_logprobs_candidate_detokenize"):
+        patches.install_skip_logprobs_candidate_detokenize()
+
+
+@pytest.mark.vllm
+def test_pinned_vllm_logprobs_processor_matches_the_patch() -> None:
+    """Fail if the pinned vLLM changes how candidates are decoded."""
+    logprobs = pytest.importorskip("vllm.v1.engine.logprobs")
+    output_processor = pytest.importorskip("vllm.v1.engine.output_processor")
+
+    # The patch keys on from_new_request(tokenizer, request) ...
+    parameters = inspect.signature(logprobs.LogprobsProcessor.from_new_request)
+    assert list(parameters.parameters) == ["tokenizer", "request"]
+    # ... which RequestState passes by keyword, next to the text detokenizer's own tokenizer.
+    request_state = inspect.getsource(output_processor.RequestState.from_new_request)
+    assert "LogprobsProcessor.from_new_request(" in request_state
+    assert "tokenizer=tokenizer" in request_state
+    # A processor without a tokenizer skips the per-candidate decoding.
+    update = inspect.getsource(logprobs.LogprobsProcessor._update_sample_logprobs)
+    assert "if self.tokenizer is None:" in update

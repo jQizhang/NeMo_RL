@@ -1,0 +1,29 @@
+# Experiment 3: lag 4, TIS on, score centering with top-32.
+defaults: ./qwen3_8b_base_common.yaml
+
+# Score centering with the top-k sampler head captured through vLLM.
+loss_fn:
+  score_centering: true
+  normalization: global_token_mean  # replaces the deprecated token_level_loss: true
+  sequence_level_importance_ratios: false
+
+policy:
+  logprob_chunk_size: 128
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    top_logprobs: 32
+    vllm_cfg:
+      logprobs_mode: processed_logprobs
+      flat_logprobs: true
+      # Capture stages only candidate IDs and logprobs; skip vLLM's per-candidate string decoding.
+      skip_logprobs_candidate_detokenize: true
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-tis-sc32-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-tis-sc32-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-tis-sc32-lr1e-6

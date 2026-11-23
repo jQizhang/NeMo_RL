@@ -1,0 +1,15 @@
+# Score centering with the top-128 sampler head, importance sampling off, no sampling filter.
+defaults: ./grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top32.yaml
+
+policy:
+  generation:
+    top_p: 1.0
+    top_logprobs: 128
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128
+
+logger:
+  log_dir: logs/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128
+  wandb:
+    name: grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128

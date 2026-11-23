@@ -1,0 +1,99 @@
+# Experiment 9: exp7 with the NeMo-Gym math reward replaced by the DAPO verifier (resources_servers/math_dapo).
+# Otherwise exp7: the same Qwen3-8B-Base / DAPO-Math-17K / NeMo-Gym setting trained
+# synchronously (lag 0) with TIS and no score centering, but through the legacy GRPO trainer with colocated
+# generation (training and vLLM share all 32 GPUs) instead of the SingleController with a dedicated vLLM node.
+# Token capture exists only on the SingleController path, so this run has none.
+defaults: ../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 500
+  use_leave_one_out_baseline: false
+  # No validation, as on the SingleController path. The Gym runner rejects a non-null max_val_samples.
+  val_period: 0
+  max_val_samples: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/qwen3-8b-base-colocated-lag0-tis-gym-dapo-lr1e-6
+  # No validation metric to rank checkpoints by.
+  metric_name: null
+  save_period: 10
+  # Save and stop before the 4 h job limit; the next job of the chain resumes from it.
+  checkpoint_must_save_by: 00:03:45:00
+
+policy:
+  model_name: /apps/models/Qwen3-8B-Base
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 2048 prompt + 8192 response.
+  max_total_sequence_length: 10240
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  automodel_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    # lr 1e-6 as in the DAPO recipes (the base default is 5e-6); min_lr and the warmup start
+    # keep the base ratio of 10%.
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_init: 1.0e-7
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      # NeMo-Gym talks to vLLM through its HTTP server, which needs the async engine.
+      async_engine: true
+      expose_http_server: true
+      tensor_parallel_size: 4
+
+data:
+  max_input_seq_length: null
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:HF_HOME}/gym-dapo/dapo17k_train_dapo.jsonl
+    split_validation_size: 0
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:HF_HOME}/gym-dapo/aime24_validation_dapo.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_dapo/configs/math_dapo.yaml
+
+logger:
+  log_dir: logs/qwen3-8b-base-colocated-lag0-tis-gym-dapo-lr1e-6
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemorl-sc-study-qwen3-8b-dapo
+    name: qwen3-8b-base-colocated-lag0-tis-gym-dapo-lr1e-6
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

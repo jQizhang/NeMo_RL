@@ -1,0 +1,15 @@
+# Experiment 5: lag 4, TIS off, score centering with top-128.
+defaults: ./exp4_lag4_tis_sc128.yaml
+
+loss_fn:
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-sc128-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-sc128-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-sc128-lr1e-6

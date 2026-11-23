@@ -1,0 +1,47 @@
+# The Qwen3.5-9B DAPO-Math-17K SingleController recipe on the NeMo-Gym rollout path with
+# token capture. Score centering needs this path, so this is the baseline for the
+# score-centering siblings. Data is prepared by Gym's prepare_dapo17k.py and
+# prepare_aime24.py, then gets an agent_ref on every row and lives under $HF_HOME/gym-dapo.
+defaults: ./grpo-qwen3.5-9b-dapomath17k-2n8g-megatron-noncolocated-single-controller.yaml
+
+token_capture:
+  enabled: true
+
+policy:
+  generation:
+    vllm_cfg:
+      expose_http_server: true
+
+data:
+  max_input_seq_length: null
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:HF_HOME}/gym-dapo/dapo17k_train.jsonl
+    split_validation_size: 0
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:HF_HOME}/gym-dapo/aime24_validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          should_use_judge: false
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller
+
+logger:
+  log_dir: logs/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller
+  wandb:
+    name: grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller

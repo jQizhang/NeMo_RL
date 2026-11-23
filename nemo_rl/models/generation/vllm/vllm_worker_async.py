@@ -96,6 +96,9 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
+from nemo_rl.models.generation.vllm.patches import (
+    SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG,
+)
 from nemo_rl.models.generation.vllm.progress_reader import VllmProgressReader
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
@@ -202,10 +205,12 @@ class _AsyncLLMHTTPClient:
         engine_loop: asyncio.AbstractEventLoop,
         *,
         flat_logprobs: bool,
+        skip_logprobs_candidate_detokenize: bool = False,
     ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
         self._flat_logprobs = flat_logprobs
+        self._skip_logprobs_candidate_detokenize = skip_logprobs_candidate_detokenize
         # Engine request ID -> captured model call ID, while the request runs.
         self._captured_requests: dict[str, str] = {}
         # Called with each request ID once its consumer is done with it.
@@ -242,6 +247,17 @@ class _AsyncLLMHTTPClient:
         ):
             sampling_params.flat_logprobs = True
         take_reasoning_ended(sampling_params, kwargs)
+        # Capture stages only candidate IDs and logprobs, so a captured call has no use
+        # for the strings vLLM would decode for every candidate.
+        if (
+            self._skip_logprobs_candidate_detokenize
+            and sampling_params.logprobs is not None
+            and _CAPTURED_MODEL_CALL.get() is not None
+        ):
+            sampling_params.extra_args = {
+                **(sampling_params.extra_args or {}),
+                SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG: True,
+            }
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -653,6 +669,13 @@ class VllmAsyncGenerationWorkerImpl(
                 self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
             )
 
+        if self.cfg["vllm_cfg"].get("skip_logprobs_candidate_detokenize"):
+            from nemo_rl.models.generation.vllm.patches import (
+                install_skip_logprobs_candidate_detokenize,
+            )
+
+            install_skip_logprobs_candidate_detokenize()
+
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
@@ -811,6 +834,9 @@ class VllmAsyncGenerationWorkerImpl(
                 self.llm,
                 self._engine_loop,
                 flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+                skip_logprobs_candidate_detokenize=bool(
+                    self.cfg["vllm_cfg"].get("skip_logprobs_candidate_detokenize")
+                ),
             )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()

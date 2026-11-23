@@ -1166,6 +1166,52 @@ def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
     socket.recv_multipart = recv_multipart
 
 
+# SamplingParams.extra_args key that marks a request whose top-k candidates are not
+# decoded to strings.
+SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG = "nrl_skip_logprobs_candidate_detokenize"
+
+
+def install_skip_logprobs_candidate_detokenize() -> None:
+    """Let a request skip vLLM's decoding of its logprob candidates to strings.
+
+    ``LogprobsProcessor`` decodes every candidate at every generated position with
+    the tokenizer, one Python-to-Rust call per candidate, on the output-handler
+    thread of the generation actor. That work grows with ``top_logprobs`` times the
+    generated length and holds the GIL while the engine's GPUs idle. A request
+    whose ``SamplingParams.extra_args`` carries ``SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG``
+    gets a ``LogprobsProcessor`` without a tokenizer, so its candidates keep
+    ``decoded_token=None``. The completion text is still detokenized: the
+    ``IncrementalDetokenizer`` keeps its own tokenizer.
+
+    Installed once per process by replacing ``LogprobsProcessor.from_new_request``.
+
+    Raises:
+        RuntimeError: If the installed vLLM does not have the internals this patches.
+    """
+    try:
+        from vllm.v1.engine.logprobs import LogprobsProcessor
+
+        original = LogprobsProcessor.from_new_request.__func__
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "skip_logprobs_candidate_detokenize is enabled but the installed vLLM does "
+            "not have LogprobsProcessor.from_new_request; disable it or update "
+            "install_skip_logprobs_candidate_detokenize in "
+            "nemo_rl/models/generation/vllm/patches.py for this vLLM version"
+        ) from e
+    if getattr(LogprobsProcessor, "_nrl_skip_candidate_detokenize", False):
+        return
+
+    def from_new_request(cls, tokenizer, request):
+        extra_args = request.sampling_params.extra_args or {}
+        if extra_args.get(SKIP_LOGPROBS_CANDIDATE_DETOKENIZE_ARG):
+            tokenizer = None
+        return original(cls, tokenizer, request)
+
+    LogprobsProcessor.from_new_request = classmethod(from_new_request)
+    LogprobsProcessor._nrl_skip_candidate_detokenize = True
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 

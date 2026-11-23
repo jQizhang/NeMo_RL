@@ -45,7 +45,11 @@ from nemo_rl.algorithms.loss.interfaces import (
     MetricNormalizer,
     make_objective_reduction,
 )
-from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
+from nemo_rl.algorithms.loss.score_centering import (
+    TIS_EFFECT_DEFAULT_BOUNDS,
+    compute_score_centering_term,
+    compute_tis_effect_metrics,
+)
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
@@ -173,6 +177,17 @@ class DraftCrossEntropyLossFn(LossFunction):
 
 
 LossNormalization = Literal["global_token_mean", "sequence_mean", "group_token_mean"]
+
+# Names (without the ``score_centering_tis_`` prefix) of the diagnostics from
+# ``compute_tis_effect_metrics``.
+_SCORE_CENTERING_TIS_EFFECT_METRICS = (
+    "grad_rms_off",
+    "grad_rms_on",
+    "grad_rms_diff",
+    "weight_dev",
+    "center_l1_off",
+    "center_l1_on",
+)
 
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
@@ -663,6 +678,10 @@ class ClippedPGLossFn(LossFunction):
             self.metric_normalizations["score_centering_head_mass"] = (
                 MetricNormalizer.TOKENS
             )
+            for name in _SCORE_CENTERING_TIS_EFFECT_METRICS:
+                self.metric_normalizations[f"score_centering_tis_{name}"] = (
+                    MetricNormalizer.TOKENS
+                )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -1161,6 +1180,22 @@ class ClippedPGLossFn(LossFunction):
             score_centering_metrics["score_centering_head_mass"] = masked_mean(
                 head_mass, mask, global_normalization_factor=global_valid_toks
             )
+            tis_effect = compute_tis_effect_metrics(
+                policy_logprobs_at_sampler_topk,
+                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
+                token_mask=mask,
+                sampler_replay=policy_support_mask is not None,
+                is_bounds=self._get_score_centering_is_bounds()
+                or (
+                    TIS_EFFECT_DEFAULT_BOUNDS[0],
+                    self.truncated_importance_sampling_ratio
+                    or TIS_EFFECT_DEFAULT_BOUNDS[1],
+                ),
+            )
+            for name, value in tis_effect.items():
+                score_centering_metrics[f"score_centering_tis_{name}"] = masked_mean(
+                    value, mask, global_normalization_factor=global_valid_toks
+                )
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio

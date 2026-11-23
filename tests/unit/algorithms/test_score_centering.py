@@ -23,7 +23,10 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
+from nemo_rl.algorithms.loss.score_centering import (
+    compute_score_centering_term,
+    compute_tis_effect_metrics,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 _REPLAY = TrainingSamplingParams(top_k=4, top_p=0.9, sampler_replay=True)
@@ -668,3 +671,142 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction
         # head/tail correction still supplies a gradient.
         assert token_lp.grad[0, 0] == 0
         assert head_lp.grad[0, 0].abs().sum() > 0
+
+
+@pytest.mark.parametrize("bounds", [(0.0, 2.0), (0.7, 1.3)])
+def test_tis_effect_metrics_match_autograd_over_a_full_head(bounds):
+    """A head holding the whole vocabulary: the norms equal the autograd gradients' ones."""
+    torch.manual_seed(31)
+    vocab = 6
+    lo, hi = bounds
+    logits = torch.randn(vocab, dtype=torch.float64, requires_grad=True)
+    q = torch.softmax(torch.randn(vocab, dtype=torch.float64), -1)
+    logp = logits.log_softmax(-1)
+    w = (logp.detach().exp() / q).clamp(lo, hi)
+    head_logp = logp.reshape(1, 1, vocab)
+    head_q_logp = q.log().reshape(1, 1, vocab)
+
+    def per_token_grads(mode):
+        term, _ = compute_score_centering_term(
+            head_logp,
+            sampler_topk_logprobs=head_q_logp,
+            importance_sampling_mode=mode,
+            is_bounds=None if mode == "off" else (lo, hi),
+            token_mask=torch.ones(1, 1),
+            sampler_replay=False,
+        )
+        return torch.stack(
+            [
+                torch.autograd.grad(
+                    -(1.0 if mode == "off" else w[x]) * logp[x] + term.sum(),
+                    logits,
+                    retain_graph=True,
+                )[0]
+                for x in range(vocab)
+            ]
+        )
+
+    g_off, g_on = per_token_grads("off"), per_token_grads("tis")
+
+    def rms(g):
+        return (q * (g**2).sum(-1)).sum().sqrt()
+
+    metrics = compute_tis_effect_metrics(
+        head_logp.detach(),
+        sampler_topk_logprobs=head_q_logp,
+        token_mask=torch.ones(1, 1),
+        sampler_replay=False,
+        is_bounds=bounds,
+    )
+    expected = {
+        "grad_rms_off": rms(g_off),
+        "grad_rms_on": rms(g_on),
+        "grad_rms_diff": rms(g_on - g_off),
+        "weight_dev": (q * (w - 1.0).abs()).sum(),
+    }
+    for name, value in expected.items():
+        torch.testing.assert_close(
+            metrics[name].reshape(()), value, atol=1e-7, rtol=1e-6
+        )
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_tis_effect_metrics_vanish_when_trainer_and_sampler_agree(replay):
+    logits = torch.tensor([0.4, -0.3, 0.9, 0.1, -1.2], dtype=torch.float64)
+    probs = logits.softmax(-1)
+    head = logits.log_softmax(-1)[:3]
+    if replay:  # the head is the whole support, renormalized
+        head = logits[:3].log_softmax(-1)
+    head = head.reshape(1, 1, 3)
+    metrics = compute_tis_effect_metrics(
+        head,
+        sampler_topk_logprobs=head,
+        token_mask=torch.ones(1, 1),
+        sampler_replay=replay,
+        is_bounds=(0.0, 2.0),
+    )
+    assert probs.sum() == pytest.approx(1.0)
+    for name in ("grad_rms_diff", "weight_dev", "center_l1_off", "center_l1_on"):
+        torch.testing.assert_close(
+            metrics[name], torch.zeros(1, 1, dtype=torch.float64), atol=1e-9, rtol=0
+        )
+
+
+def test_tis_effect_metrics_are_zero_at_inactive_positions():
+    head = torch.randn(1, 3, 4).log_softmax(-1)
+    metrics = compute_tis_effect_metrics(
+        head,
+        sampler_topk_logprobs=torch.randn(1, 3, 4).log_softmax(-1),
+        token_mask=torch.tensor([[1.0, 0.0, 1.0]]),
+        sampler_replay=False,
+        is_bounds=(0.0, 2.0),
+    )
+    for value in metrics.values():
+        assert value[0, 1] == 0 and torch.isfinite(value).all()
+
+
+@pytest.mark.parametrize("mode", ["off", "tis"])
+def test_loss_reports_the_tis_effect_diagnostics_in_every_mode(mode):
+    """The diagnostics are counterfactual: they appear with TIS on and off."""
+    n = 2
+    logits = torch.tensor([0.6, -0.2, 0.1, -0.7, -1.5])
+    logp = logits.log_softmax(-1)
+    q = torch.tensor([0.4, 0.3, 0.2, 0.05, 0.05])
+    ids = torch.tensor([0, 2])
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.tensor([[0.0] + [1.0] * n]),
+            "sample_mask": torch.tensor([1.0]),
+            "advantages": torch.tensor([[0.0] + [1.5] * n]),
+            "generation_logprobs": torch.cat([torch.zeros(1), q[ids].log()])[None],
+            "sampler_topk_logprobs": torch.cat(
+                [torch.zeros(1, 5), q.log().expand(n, 5)]
+            )[None],
+        }
+    )
+    tis = mode == "tis"
+    cfg = ClippedPGLossConfig(
+        score_centering=True,
+        reference_policy_kl_penalty=0,
+        force_on_policy_ratio=True,
+        use_importance_sampling_correction=tis,
+        truncated_importance_sampling_type="tis" if tis else None,
+        truncated_importance_sampling_ratio=1.3 if tis else None,
+    )
+    _, metrics = ClippedPGLossFn(cfg)(
+        next_token_logprobs=logp[ids][None],
+        policy_logprobs_at_sampler_topk=logp.expand(n, 5)[None],
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(float(n)),
+    )
+    for name in (
+        "grad_rms_off",
+        "grad_rms_on",
+        "grad_rms_diff",
+        "weight_dev",
+        "center_l1_off",
+        "center_l1_on",
+    ):
+        assert math.isfinite(float(metrics[f"score_centering_tis_{name}"]))
+    assert float(metrics["score_centering_tis_grad_rms_diff"]) > 0

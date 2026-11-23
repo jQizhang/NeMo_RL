@@ -1,0 +1,14 @@
+# Experiment 4: lag 4, TIS on, score centering with top-128.
+defaults: ./exp3_lag4_tis_sc32.yaml
+
+policy:
+  generation:
+    top_logprobs: 128
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-tis-sc128-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-tis-sc128-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-tis-sc128-lr1e-6

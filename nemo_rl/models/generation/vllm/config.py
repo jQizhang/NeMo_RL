@@ -113,6 +113,13 @@ class VllmSpecificArgs(TypedDict):
     # server that ask for logprobs but not prompt logprobs, so it requires
     # async_engine: true and expose_http_server: true. Default false.
     flat_logprobs: NotRequired[bool]
+    # For captured calls (token capture) that ask for logprobs, skip vLLM's per-position
+    # decoding of every top-k candidate into a string. Capture stages only token IDs and
+    # logprobs, and the decoding is single-threaded work on the generation actor that
+    # grows with top_logprobs * generated tokens. The completion text is still decoded.
+    # Applies to requests through the exposed HTTP server, so it requires
+    # async_engine: true and expose_http_server: true. Default false.
+    skip_logprobs_candidate_detokenize: NotRequired[bool]
     # Bound how long vLLM's front-end output loops may hold the generation actor's
     # event loop under a backlog: output_handler yields once per engine step and the
     # output-socket reader after this many ms of continuous work (20 is a good value).
@@ -391,6 +398,14 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
             "through the async engine's HTTP server; it requires async_engine: true "
             "and expose_http_server: true."
+        )
+    if vllm_cfg.get("skip_logprobs_candidate_detokenize") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.skip_logprobs_candidate_detokenize only applies "
+            "to requests through the async engine's HTTP server; it requires "
+            "async_engine: true and expose_http_server: true."
         )
     budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
     if budget_ms is None:

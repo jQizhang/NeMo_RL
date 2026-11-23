@@ -1,0 +1,19 @@
+# Experiment 6: lag 4, TIS off, score centering with top-128, sampling with top-p 0.97.
+# Score centering under a sampling filter needs Sampler Replay, and top-p needs a top_k that bounds the
+# kept set, so top_k equals the captured head size.
+defaults: ./exp5_lag4_sc128.yaml
+
+policy:
+  generation:
+    top_k: 128
+    top_p: 0.97
+    sampler_replay:
+      enabled: true
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-sc128-topp0.97-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-sc128-topp0.97-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-sc128-topp0.97-lr1e-6

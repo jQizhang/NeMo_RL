@@ -143,3 +143,94 @@ def compute_score_centering_term(
     coefficients = mass - alpha.unsqueeze(-1) * p
     term = (coefficients.detach() * p_log).sum(-1)
     return torch.where(active, term, 0.0), torch.where(active, head_mass, 0.0)
+
+
+# TIS bounds the diagnostics below assume when the run configures none: the lower
+# bound of ``tis`` and the ratio our recipes use.
+TIS_EFFECT_DEFAULT_BOUNDS = (0.0, 2.0)
+
+
+def compute_tis_effect_metrics(
+    policy_logprobs_at_sampler_topk: torch.Tensor,
+    *,
+    sampler_topk_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sampler_replay: bool,
+    is_bounds: tuple[float, float],
+) -> dict[str, torch.Tensor]:
+    """Per-token size of the actor update with and without TIS, and of their difference.
+
+    Both estimators are centered, so each has zero mean over the sampler's draws and
+    what separates them is their spread. At every position this takes each head id
+    ``x`` as the hypothetical sampled token, weights it by ``q_x``, and measures the
+    gradient of the per-token loss on the logits (per unit advantage):
+
+    * off: ``g(x) = (e_x - p) - (c_off - S_off p)``, importance weight 1;
+    * on:  ``g(x) = w_x (e_x - p) - (c_on - S_on p)`` with ``w_x = clamp(p_x / q_x)``,
+
+    where ``c`` are the head coefficients of ``compute_score_centering_term`` for the
+    ``off`` and ``tis`` modes and ``S`` their sum. The expectation over ``x`` needs no
+    sampled token or ID, and every norm is closed-form in ``k``. The vocabulary
+    outside the head is ignored, which is the sampler's tail mass.
+
+    Args:
+        policy_logprobs_at_sampler_topk: Trainer log-probs at the sampler's top-k ids,
+            ``[B, S, k]``; ``-inf`` where the sampler filtered the id out.
+        sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``.
+        token_mask: Active token/sample positions, ``[B, S]``.
+        sampler_replay: Whether the head holds the whole support, so ``rho`` is zero.
+        is_bounds: ``(lo, hi)`` of the TIS weight ``clamp(p / q, lo, hi)``.
+
+    Returns:
+        ``[B, S]`` tensors, zero at inactive positions:
+
+        * ``grad_rms_off`` / ``grad_rms_on``: ``sqrt(E_q ||g||^2)`` without / with TIS;
+        * ``grad_rms_diff``: ``sqrt(E_q ||g_on - g_off||^2)``;
+        * ``weight_dev``: ``E_q |w - 1|``, the reweighting of the sampled-token term;
+        * ``center_l1_off`` / ``center_l1_on``: ``sum_v |c_v - S p_v|``, the size of the
+          centering vector that is subtracted from the logit gradient without / with TIS.
+    """
+    lo, hi = is_bounds
+    active = token_mask.bool()
+    slots = active.unsqueeze(-1) & ~torch.isneginf(sampler_topk_logprobs)
+    p = torch.where(slots, policy_logprobs_at_sampler_topk.detach().exp(), 0.0)
+    q = torch.where(slots, sampler_topk_logprobs.detach().exp(), 0.0)
+    if sampler_replay:
+        rho = torch.zeros_like(q[..., 0])
+    else:
+        rho = (1.0 - q.sum(-1)).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
+
+    c_off = q - rho.unsqueeze(-1) * p
+    mass = torch.minimum(torch.maximum(p, lo * q), hi * q)
+    alpha = torch.minimum(torch.maximum(torch.ones_like(rho), lo * rho), hi * rho)
+    c_on = mass - alpha.unsqueeze(-1) * p
+    # g(x) = w_x (e_x - p) - a, with a = c - S p. The weight is 0 where q is 0.
+    a_off = c_off - c_off.sum(-1, keepdim=True) * p
+    a_on = c_on - c_on.sum(-1, keepdim=True) * p
+    w = torch.where(q > 0, p / q.clamp(min=1e-30), 0.0).clamp(lo, hi)
+
+    def second_moment(weight, a):
+        """``E_q ||weight_x (e_x - p) - a||^2`` over the head slots x."""
+        e_minus_p_sq = 1.0 - 2.0 * p + (p * p).sum(-1, keepdim=True)
+        cross = a - (p * a).sum(-1, keepdim=True)  # <e_x - p, a>
+        return (
+            q
+            * (
+                weight**2 * e_minus_p_sq
+                - 2.0 * weight * cross
+                + (a * a).sum(-1, keepdim=True)
+            )
+        ).sum(-1)
+
+    ones = torch.ones_like(w)
+    delta = a_on - a_off
+    metrics = {
+        "grad_rms_off": second_moment(ones, a_off),
+        "grad_rms_on": second_moment(w, a_on),
+        "grad_rms_diff": second_moment(w - ones, delta),
+    }
+    metrics = {k: v.clamp(min=0.0).sqrt() for k, v in metrics.items()}
+    metrics["weight_dev"] = (q * (w - 1.0).abs()).sum(-1)
+    metrics["center_l1_off"] = a_off.abs().sum(-1)
+    metrics["center_l1_on"] = a_on.abs().sum(-1)
+    return {k: torch.where(active, v, 0.0) for k, v in metrics.items()}

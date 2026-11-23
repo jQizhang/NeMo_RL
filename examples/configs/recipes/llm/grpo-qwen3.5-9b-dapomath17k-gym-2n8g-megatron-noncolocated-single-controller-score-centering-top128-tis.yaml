@@ -1,0 +1,16 @@
+# Score centering with the top-128 sampler head and TIS, no sampling filter, flat logprobs
+# (inherited from the top-32 recipe) for the vectorized top-k extraction.
+defaults: ./grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top32-tis.yaml
+
+policy:
+  generation:
+    top_p: 1.0
+    top_logprobs: 128
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128-tis
+
+logger:
+  log_dir: logs/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128-tis
+  wandb:
+    name: grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top128-tis

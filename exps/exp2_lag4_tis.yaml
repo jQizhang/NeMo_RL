@@ -1,0 +1,10 @@
+# Experiment 2: lag 4, TIS on.
+defaults: ./qwen3_8b_base_common.yaml
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-tis-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-tis-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-tis-lr1e-6

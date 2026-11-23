@@ -1,0 +1,33 @@
+# Score centering with the top-32 sampler head and importance sampling off.
+defaults: ./grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller.yaml
+
+loss_fn:
+  score_centering: true
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_ratio: null
+
+policy:
+  logprob_chunk_size: 128
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    top_logprobs: 32
+    vllm_cfg:
+      logprobs_mode: processed_logprobs
+      # Selects the vectorized top-k extraction (#5034); needs async_engine and expose_http_server.
+      flat_logprobs: true
+      # Capture stages only candidate IDs and logprobs; skip vLLM's per-candidate string decoding.
+      skip_logprobs_candidate_detokenize: true
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top32
+
+logger:
+  log_dir: logs/grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top32
+  wandb:
+    name: grpo-qwen3.5-9b-dapomath17k-gym-2n8g-megatron-noncolocated-single-controller-score-centering-top32
