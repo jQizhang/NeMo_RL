@@ -1,0 +1,23 @@
+# Experiment 5 with the NeMo-Gym math reward replaced by the DAPO verifier (resources_servers/math_dapo).
+# Otherwise exp5: lag 4, TIS off, score centering with top-128.
+defaults: ./exp5_lag4_sc128.yaml
+
+data:
+  train:
+    data_path: ${oc.env:HF_HOME}/gym-dapo/dapo17k_train_dapo.jsonl
+  validation:
+    data_path: ${oc.env:HF_HOME}/gym-dapo/aime24_validation_dapo.jsonl
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_dapo/configs/math_dapo.yaml
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag4-sc128-gym-dapo-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag4-sc128-gym-dapo-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag4-sc128-gym-dapo-lr1e-6

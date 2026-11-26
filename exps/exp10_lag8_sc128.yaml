@@ -1,0 +1,17 @@
+# Experiment 10: exp5 with the lag (staleness) raised from 4 to 8.
+# Lag 8, TIS off, score centering with top-128, NeMo-Gym math_dapo reward.
+defaults: ./exp5_lag4_sc128.yaml
+
+# The buffer holds (lookahead + 1) prompt batches: (8 + 1) * 32 prompts.
+async_rl:
+  sampler:
+    max_lookahead_versions: 8
+  max_buffered_rollouts: 288
+
+checkpointing:
+  checkpoint_dir: results/qwen3-8b-base-lag8-sc128-lr1e-6
+
+logger:
+  log_dir: logs/qwen3-8b-base-lag8-sc128-lr1e-6
+  wandb:
+    name: qwen3-8b-base-lag8-sc128-lr1e-6

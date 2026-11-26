@@ -74,11 +74,11 @@ data:
   max_input_seq_length: null
   train:
     dataset_name: NemoGymDataset
-    data_path: ${oc.env:HF_HOME}/gym-dapo/dapo17k_train.jsonl
+    data_path: ${oc.env:HF_HOME}/gym-dapo/dapo17k_train_dapo.jsonl
     split_validation_size: 0
   validation:
     dataset_name: NemoGymDataset
-    data_path: ${oc.env:HF_HOME}/gym-dapo/aime24_validation.jsonl
+    data_path: ${oc.env:HF_HOME}/gym-dapo/aime24_validation_dapo.jsonl
   default:
     dataset_name: NemoGymDataset
     env_name: nemo_gym
@@ -90,11 +90,7 @@ env:
   nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - resources_servers/math_with_judge/configs/math_with_judge.yaml
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          should_use_judge: false
+    - resources_servers/math_dapo/configs/math_dapo.yaml
 
 logger:
   wandb_enabled: true
